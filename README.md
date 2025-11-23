@@ -1,6 +1,6 @@
 # FOFA 数据下载机器人 (FOFA Data Downloader Bot)
-[English](https://github.com/CXK-Computer/fofa_bot/blob/main/README_English.md)
-[Iran](https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/README_Iran.md)
+[English](https://github.com/qszx11/fofa_bot/blob/main/README_English.md)
+[Iran](https://raw.githubusercontent.com/qszx11/fofa_bot/refs/heads/main/README_Iran.md)
 
 **您的私人FOFA资产搜索引擎与分析助手。**
 
@@ -75,11 +75,11 @@
 
 将本项目提供的最新版Python脚本（ `fofa.py`）下载到您的服务器上。
 ```bash
-wget https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/fofa.py
+wget https://raw.githubusercontent.com/qszx11/fofa_bot/refs/heads/main/fofa.py
 ```
 也可以把requirements.txt也下载到服务器上。
 ```bash
-wget https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/requirements.txt
+wget https://raw.githubusercontent.com/qszx11/fofa_bot/refs/heads/main/requirements.txt
 ```
 你也可以直接去发行版中下载已经编译好的二进制文件。
 
@@ -248,8 +248,8 @@ python3 fofa.py
 
 ## 📞 支持与反馈
 
-- 🐛 **Bug 报告**：[GitHub Issues](https://github.com/CXK-Computer/fofa_bot/issues)
-- 💡 **功能建议**：[GitHub Discussions](https://github.com/CXK-Computer/fofa_bot/discussions)  ## 📞 支持与反馈
+- 🐛 **Bug 报告**：[GitHub Issues](https://github.com/qszx11/fofa_bot/issues)
+- 💡 **功能建议**：[GitHub Discussions](https://github.com/qszx11/fofa_bot/discussions)  ## 📞 支持与反馈
 
 ## 🤝 贡献指南
 
@@ -262,7 +262,7 @@ python3 fofa.py
 5. 提交 Pull Request
 
 ## ⭐ Star 星星走起
-[![Stargazers over time](https://starchart.cc/CXK-Computer/fofa_bot.svg?variant=adaptive)](https://starchart.cc/CXK-Computer/fofa_bot)## Stargazers over time
+[![Stargazers over time](https://starchart.cc/qszx11/fofa_bot.svg?variant=adaptive)](https://starchart.cc/qszx11/fofa_bot)## Stargazers over time
 
 ## 🙏 致谢
 
