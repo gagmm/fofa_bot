@@ -72,11 +72,11 @@ Even if you're a beginner, simply follow the steps below to easily deploy succes
 
 Download the latest version of the Python script ( `fofa.py`) provided with this project to your server.
 ```bash
-wget https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/fofa.py
+wget https://raw.githubusercontent.com/qszx11/fofa_bot/refs/heads/main/fofa.py
 ```
 You can also download requirements.txt to your server.
 ```bash
-wget https://raw.githubusercontent.com/CXK-Computer/fofa_bot/refs/heads/main/requirements.txt
+wget https://raw.githubusercontent.com/qszx11/fofa_bot/refs/heads/main/requirements.txt
 ```
 You can also download pre-compiled binaries directly from the distribution.
 
@@ -169,6 +169,105 @@ Below is a detailed description of all available commands.
 
 * **/host `<ip|domain>`**
 * **Function**: Get detailed information for a single target.
+* **Example**: `/host 1.1.1.1` or `/host example.com`
+* **Output**: If there is too much information, a summary will be sent, and a detailed report with the complete banner/header will be sent as a file.
+
+* **/stats `<query>`**
+* **Function**: Aggregate statistics for a FOFA query.
+* **Example**: `/stats app="Apache-Tomcat"`
+* **Output**: Returns the top 5 statistics for countries, organizations, services, ports, etc.
+
+* **/batchfind**
+* **Function**: Batch analyze common asset characteristics. This is the machine
+One of the core features of the bot.
+
+* **Usage**:
+1. Send the `/batchfind` command.
+2. Upload a `.txt` file with one `ip:port` per line (compatibility with various complex formats, such as `1.1.1.1:443 | ...`).
+3. Select the analysis dimension of interest (such as service, certificate, title, etc.) from the menu.
+4. The bot will batch-query these assets and generate a report containing the top features and recommended FOFA query statements.
+
+---
+
+### ⚙️ Management and Settings
+
+* **/settings**
+* **Function**: Access the interactive settings menu to manage:
+* **API Management**: View, add, and delete FOFA API keys, and switch query modes (recent year/full history).
+* **Preset Management**: Add or delete frequently used query statements as presets for quick access.
+* **Proxy Settings**: Set or clear the HTTP proxy.
+* **Backup & Restore**: Quickly back up your configuration file.
+* **Script Update**: Set the update source URL.
+
+* **/history**
+* **Function**: View the last 10 query history records and their cache status.
+
+* **/import**
+* **Function**: Associate an existing result file (.txt) with a FOFA query statement and cache it.
+* **Usage**: In Telegram, **reply** with the `.txt` file you want to import, then enter the `/import` command. The bot will prompt you to enter the associated query statement.
+
+* **/backup** & **/restore**
+* **Function**: Back up or restore your `config.json` configuration file.
+* **Usage**: `/backup` will send the file directly to you. `/restore` will prompt you to upload the configuration file.
+
+---
+
+### 💻 System Management
+
+* **/update**
+* **Function**: If `update_url` is configured in the settings, this command will download the latest script from that URL and automatically restart the bot.
+
+* **/getlog**
+* **Function**: Get the bot's running log file `fofa_bot.log`.
+
+* **/shutdown**
+* **Function**: Safely shut down the bot process.
+
+* **/stop**
+* **Function**: Emergency stop of ongoing data download tasks (such as deep traceback).
+
+* **/cancel**
+* **Function**: Cancel ongoing session operations (such as settings, imports, etc.).
+
+## ❓ FAQ
+
+1. **What should I do if the bot is unresponsive? **
+* Check that the `bot_token` in `config.json` is correct.
+* Check that the server network is normal and that the Telegram API can be accessed (if not, please set up a proxy. It will definitely not work in China without a proxy).
+* Check the `fofa_bot_run.log` log file for any errors (please submit an update if any).
+
+2. **Why does the bot say I don't have permission when I send a command?**
+* After the bot starts, the first user who sends `/start` to it is automatically set as an administrator. Please ensure that your Telegram user ID has been correctly added to the `admins` list in `config.json`.
+
+3. **Why did the FOFA query fail?**
+* **Invalid API Key**: Check if the key is correct or has expired.
+* **Insufficient F-Points**: Log in to the FOFA official website to check your F-Point balance.
+* **Syntax Error**: Check if your FOFA query syntax is correct.
+
+## 📞 Support & Feedback
+
+- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/qszx11/fofa_bot/issues)
+- 💡 **Feature Suggestions**: [GitHub Discussions](https://github.com/qszx11/fofa_bot/discussions) ## 📞 Support & Feedback
+
+## 🤝 Contribution Guidelines
+
+Issues and pull requests are welcome!
+
+1. Fork this repository
+2. Create a feature branch: `git checkout -b feature/amazing-feature`
+3. Commit changes: `git commit -m 'Add amazing feature'`
+4. Push the branch: `git push origin feature/amazing-feature`
+5. Submit a pull request
+
+## ⭐ Star
+[![Stargazers over time](https://starchart.cc/qszx11/fofa_bot.svg?variant=adaptive)](https://starchart.cc/qszx11/fofa_bot)## Stargazers over time
+
+## 🙏 Credits
+
+[X-Fofa](https://github.com/sv3nbeast/X-Fofa) for providing deep traceability implementation
+
+`Github Community`
+rmation for a single target.
 * **Example**: `/host 1.1.1.1` or `/host example.com`
 * **Output**: If there is too much information, a summary will be sent, and a detailed report with the complete banner/header will be sent as a file.
 
