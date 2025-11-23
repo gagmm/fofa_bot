@@ -1,0 +1,12 @@
+{
+    "bot_token": "在这里粘贴你的Telegram Bot Token",
+    "apis": [
+        "在这里粘贴你的第一个FOFA API Key"
+    ],
+    "admins": [],
+    "proxy": "",
+    "full_mode": false,
+    "public_mode": false,
+    "presets": [],
+    "update_url": ""
+}

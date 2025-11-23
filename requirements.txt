@@ -1,0 +1,6 @@
+pandas
+openpyxl
+pysocks
+requests[socks]
+tqdm
+python-telegram-bot==13.15
