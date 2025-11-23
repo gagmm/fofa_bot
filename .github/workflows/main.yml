@@ -1,0 +1,168 @@
+name: Build Cross-Platform Executable for fofa.py
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'fofa.py'
+      - 'requirements.txt'
+  
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Which platform(s) to build for?'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+          - macos
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_id: 'linux'
+            asset_name: fofa-linux  # <-- 我们将使用这个名字来重命名
+            asset_path: dist/fofa
+          - os: windows-latest
+            platform_id: 'windows'
+            asset_name: fofa-windows.exe # <-- 和这个
+            asset_path: dist/fofa.exe
+          - os: macos-latest
+            platform_id: 'macos'
+            asset_name: fofa-macos # <-- 和这个
+            asset_path: dist/fofa
+            
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check if job should run
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        run: echo "✅ This build for ${{ matrix.platform_id }} is proceeding."
+      
+      - name: Checkout repository
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        run: pyinstaller --name fofa --onefile --clean fofa.py
+      
+      - name: Upload artifact
+        if: |
+          github.event_name == 'push' ||
+          github.event.inputs.platforms == 'all' ||
+          github.event.inputs.platforms == matrix.platform_id
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_path }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: success() || failure()
+
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # ==========================================================
+      # ==========[ START OF CORRECTION / 这是修正的部分 ]==========
+      # ==========================================================
+      - name: Rename artifacts for unique release names
+        run: |
+          echo "Listing downloaded artifacts and their structure:"
+          ls -R dist
+
+          # 循环处理每个下载下来的文件夹 (e.g., dist/fofa-linux, dist/fofa-windows.exe)
+          for dir in dist/*; do
+            # 获取文件夹名 (e.g., fofa-linux)
+            asset_name=$(basename "$dir")
+            # 找到文件夹里实际的文件 (e.g., fofa 或 fofa.exe)
+            original_file=$(find "$dir" -type f -name "fofa*")
+            if [ -n "$original_file" ]; then
+              # 重命名文件 (e.g., mv dist/fofa-linux/fofa dist/fofa-linux/fofa-linux)
+              mv "$original_file" "$dir/$asset_name"
+              echo "Renamed '$original_file' to '$dir/$asset_name'"
+            fi
+          done
+          
+          echo "Listing files after renaming:"
+          ls -R dist
+      # ==========================================================
+      # ===========[ END OF CORRECTION / 修正部分结束 ]============
+      # ==========================================================
+
+      - name: Check for renamed files
+        id: check_files
+        run: |
+          if [ -z "$(ls -A dist)" ]; then
+            echo "No artifacts were found. Skipping release creation."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "Artifacts found. Proceeding with release."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Generate unique tag name
+        if: steps.check_files.outputs.skip == 'false'
+        id: generate_tag
+        run: |
+          echo "tag=dev-$(date +'%Y%m%d')-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Create new Pre-release
+        if: steps.check_files.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.generate_tag.outputs.tag }}
+          name: "Dev Build ${{ steps.generate_tag.outputs.tag }}"
+          body: |
+            This is an automated cross-platform build from the `main` branch.
+            - **Commit:** `${{ github.sha }}`
+            - **See details:** `${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}`
+          # 这个通配符现在可以找到被重命名后的唯一文件了
+          files: dist/*/*
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
