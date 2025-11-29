@@ -41,6 +41,8 @@ LOG_FILE = 'fofa_bot.log'
 FOFA_CACHE_DIR = 'fofa_file'
 ANONYMOUS_KEYS_FILE = 'fofa_anonymous.json'
 SCAN_TASKS_FILE = 'scan_tasks.json'
+MONITOR_TASKS_FILE = 'monitor_tasks.json' # 新增监控配置
+MONITOR_DATA_DIR = 'monitor_data' # 新增监控数据目录
 MAX_HISTORY_SIZE = 50
 MAX_SCAN_TASKS = 50
 CACHE_EXPIRATION_SECONDS = 24 * 60 * 60
@@ -353,6 +355,86 @@ def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host
     # FIX: Ensure 'next' parameter is always present, and empty on the first call, to comply with API spec.
     params['next'] = next_id if next_id is not None else ""
     return _make_api_request(FOFA_NEXT_URL, params, proxy_session=proxy_session)
+
+# --- 智能下载核心工具 ---
+def iter_fofa_traceback(key, query, limit=None, proxy_session=None, page_size=10000):
+    """
+    通过 before/after 时间回溯机制迭代获取数据的生成器。
+    Yields: 结果列表
+    """
+    current_query = query
+    last_page_date = None
+    collected_count = 0
+    
+    # 简单的哈希去重（用于处理同一天的分页重叠）
+    page_hashes = set() 
+    
+    while True:
+        # 获取第一页
+        # 注意：这里需要请求 lastupdatetime 以便确定下一页的 before 时间锚点
+        # 为了兼容性，如果没有 VIP 权限，这个 fields 请求可能会被忽略或者需要外部确保 Key 权限
+        # 这里假设调用此函数时已使用了具备权限的 Key
+        fields = "host,lastupdatetime"
+        
+        # 使用 execute_query_with_fallback 的等价单次调用，或者直接调 fetch。
+        # 这里是迭代器内部，假定 key 是确定的。
+        # 如果 Key 等级 < 1 (无法查询 lastupdatetime)，则只能查普通翻页，这会导致大量数据下的死循环，
+        # 所以外部必须确保 key level >= 1
+        
+        data, error = fetch_fofa_data(key, current_query, page=1, page_size=page_size, fields=fields, proxy_session=proxy_session)
+        
+        if error or not data or not data.get('results'):
+            break
+
+        results = data.get('results', [])
+        if not results:
+            break
+
+        # Yield current batch
+        # 我们返回完整结果以便外部处理
+        yield results
+        collected_count += len(results)
+        if limit and collected_count >= limit:
+            break
+
+        # 分析最后一条的时间，设置新的 Time Anchor
+        # FOFA 结果是倒序的，最后一条是最旧的
+        # 取最后一条的时间，作为下一轮的 before
+        valid_anchor_found = False
+        
+        # 倒序寻找有效时间戳
+        for i in range(len(results) - 1, -1, -1):
+            if not results[i] or len(results[i]) < 2: continue
+            
+            # 格式可能是 "2023-01-01 12:00:00"
+            ts_str = results[i][-1] # lastupdatetime
+            try:
+                current_date_obj = datetime.strptime(ts_str.split(' ')[0], '%Y-%m-%d').date()
+                
+                # 防止死循环：如果这页找到的日期 >= 上一页找到的锚点日期，说明在这一天内卡住了
+                # 我们需要强制将日期 -1 天来跳过这一天（会有数据损失，但好过死循环）
+                # 或者，FOFA api 支持 page 翻页，如果是在同一天，我们可以尝试翻 page 2?
+                # 简化起见：Time Slicing 策略是“天”级的。如果一天 > 10000 条，这里的逻辑会跳过当天剩余数据。
+                # 但根据 Smart Slicing 假设，国家被剥离后，单日单国数据很难 > 10000。
+                
+                next_page_date_obj = current_date_obj
+                
+                if last_page_date and current_date_obj >= last_page_date:
+                    # 如果时间没有前推，强制 -1 天
+                    next_page_date_obj -= timedelta(days=1)
+                
+                last_page_date = next_page_date_obj
+                
+                # 更新查询：追加 before 参数
+                # 注意处理 query 中现有的括号
+                current_query = f'({query}) && before="{next_page_date_obj.strftime("%Y-%m-%d")}"'
+                valid_anchor_found = True
+                break
+            except (ValueError, TypeError, IndexError):
+                continue
+        
+        if not valid_anchor_found:
+            break
 
 def check_and_classify_keys():
     logger.info("--- 开始检查并分类API Keys ---")
@@ -886,6 +968,193 @@ def run_batch_traceback_query(context: CallbackContext):
     else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
     context.bot_data.pop(stop_flag, None)
 
+# --- 监控系统 (Data Reservoir + Radar Mode) ---
+def monitor_command(update: Update, context: CallbackContext):
+    args = context.args
+    if not args:
+        help_txt = (
+            "📡 *监控雷达指令手册*\n\n"
+            "`/monitor add <query>` \\- 添加新的监控任务\n"
+            "`/monitor list` \\- 查看当前运行的任务\n"
+            "`/monitor get <id>` \\- 打包提取任务数据\n"
+            "`/monitor del <id>` \\- 删除监控任务\n\n"
+            "_监控任务会将新数据自动沉淀到本地数据库，您随时可以提取。_"
+        )
+        update.message.reply_text(help_txt, parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    sub_cmd = args[0].lower()
+    
+    if sub_cmd == 'add':
+        if len(args) < 2:
+            update.message.reply_text("用法: `/monitor add <query>`")
+            return
+        query_text = " ".join(args[1:])
+        # 生成简短ID
+        task_id = hashlib.md5(query_text.encode()).hexdigest()[:8]
+        
+        if task_id in MONITOR_TASKS:
+            update.message.reply_text(f"⚠️ 任务已存在 (ID: `{task_id}`)", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+            
+        MONITOR_TASKS[task_id] = {
+            "query": query_text,
+            "chat_id": update.effective_chat.id,
+            "added_at": int(time.time()),
+            "last_run": 0,
+            "interval": 3600, # 初始1小时
+            "status": "active"
+        }
+        save_monitor_tasks()
+        
+        # 立即启动第一次调度 (Use Jitter 0 for first run)
+        context.job_queue.run_once(run_monitor_execution_job, 1, context={"task_id": task_id}, name=f"monitor_{task_id}")
+        update.message.reply_text(f"✅ 监控雷达已启动\nID: `{task_id}`\n查询: `{escape_markdown_v2(query_text)}`\n\n数据将自动沉淀，使用 `/monitor get {task_id}` 提取。", parse_mode=ParseMode.MARKDOWN_V2)
+
+    elif sub_cmd == 'list':
+        if not MONITOR_TASKS:
+            update.message.reply_text("📭 当前没有活跃的监控任务。")
+            return
+        msg = ["*📡 活跃监控任务*"]
+        for tid, task in MONITOR_TASKS.items():
+            if task.get('status') != 'active': continue
+            
+            # 统计本地数据
+            data_file = os.path.join(MONITOR_DATA_DIR, f"{tid}.txt")
+            count = 0
+            if os.path.exists(data_file):
+                try: 
+                    with open(data_file, 'r', encoding='utf-8') as f: count = sum(1 for _ in f)
+                except: pass
+                
+            last_run_str = "等待中"
+            if task.get('last_run'):
+                dt = datetime.fromtimestamp(task['last_run']).replace(tzinfo=tz.tzlocal())
+                last_run_str = dt.strftime('%H:%M')
+            
+            # 将interval转换为分钟或小时显示
+            interval = task.get('interval', 3600)
+            if interval < 3600: dur = f"{interval//60}分"
+            else: dur = f"{interval/3600:.1f}小时"
+
+            msg.append(f"📡 `{tid}`: *{escape_markdown_v2(task['query'][:25])}...*")
+            msg.append(f"   📦 库存: *{count}* \| ⏱ 上次: {last_run_str} \| ⏳ 频率: {dur}")
+            msg.append("") # Spacer
+            
+        update.message.reply_text("\n".join(msg), parse_mode=ParseMode.MARKDOWN_V2)
+
+    elif sub_cmd == 'del':
+        if len(args) < 2: 
+            update.message.reply_text("用法: `/monitor del <task_id>`")
+            return
+        tid = args[1]
+        if tid in MONITOR_TASKS:
+            # 取消现有 Job
+            for job in context.job_queue.get_jobs_by_name(f"monitor_{tid}"):
+                job.schedule_removal()
+                
+            del MONITOR_TASKS[tid]
+            save_monitor_tasks()
+            
+            # 删除数据文件? (保留数据更安全，只删任务)
+            update.message.reply_text(f"🗑️ 任务 `{tid}` 已停止并移除配置。", parse_mode=ParseMode.MARKDOWN_V2)
+        else:
+            update.message.reply_text("❌ 任务ID不存在。")
+
+    elif sub_cmd == 'get':
+        if len(args) < 2:
+            update.message.reply_text("用法: `/monitor get <task_id>`") 
+            return
+        tid = args[1]
+        
+        # 即使任务不在 config 中，只要有文件也可以取（防意外删除）
+        data_file = os.path.join(MONITOR_DATA_DIR, f"{tid}.txt")
+        if not os.path.exists(data_file):
+            if tid not in MONITOR_TASKS:
+                update.message.reply_text("❌ 找不到该ID的任务记录或数据文件。")
+            else:
+                update.message.reply_text("🤷‍♀️ 该任务暂无任何数据沉淀。")
+            return
+            
+        task_info = MONITOR_TASKS.get(tid, {})
+        q_info = task_info.get('query', '未知查询')
+        
+        send_file_safely(context, update.effective_chat.id, data_file, caption=f"📦 监控数据导出\nID: `{tid}`\nQuery: `{escape_markdown_v2(q_info)}`", parse_mode=ParseMode.MARKDOWN_V2)
+        upload_and_send_links(context, update.effective_chat.id, data_file)
+        
+    else:
+        update.message.reply_text("❌ 未知命令。请使用 `/monitor` 查看帮助。")
+
+def run_monitor_execution_job(context: CallbackContext):
+    """自适应监控雷达核心逻辑"""
+    job_context = context.job.context
+    task_id = job_context.get('task_id')
+    
+    if task_id not in MONITOR_TASKS: return
+    task = MONITOR_TASKS[task_id]
+    
+    query_text = task['query']
+    os.makedirs(MONITOR_DATA_DIR, exist_ok=True)
+    db_file = os.path.join(MONITOR_DATA_DIR, f"{task_id}.txt")
+    
+    # 1. 载入布隆过滤器（或简易Set）
+    known_hashes = set()
+    if os.path.exists(db_file):
+        try:
+            with open(db_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line: known_hashes.add(hashlib.md5(line.encode()).hexdigest())
+        except Exception as e:
+            logger.error(f"Error reading monitor DB: {e}")
+
+    # 2. 执行检测 (Radar Ping)
+    # 策略：默认抓第一页（最新数据）。如果是高速模式，抓前3页。
+    # 我们只关心是否有 NEW 数据来决定频率。
+    
+    # 这里我们只取 fields="host,ip,port"，为了省流量且通用
+    fetch_func = lambda k, kl, ps: fetch_fofa_data(k, query_text, page=1, page_size=100, fields="host", proxy_session=ps)
+    data, _, _, _, _, error = execute_query_with_fallback(fetch_func)
+    
+    new_data_lines = []
+    
+    if not error and data and data.get('results'):
+        results = data.get('results')
+        for item in results:
+            line_str = item[0] if isinstance(item, list) else str(item)
+            h = hashlib.md5(line_str.strip().encode()).hexdigest()
+            if h not in known_hashes:
+                new_data_lines.append(line_str.strip())
+                
+    # 3. 自适应调频算法 (Adaptive Frequency)
+    # 基础频率
+    base_interval = 3600 
+    current_interval = task.get('interval', base_interval)
+    
+    if len(new_data_lines) > 0:
+        # 命中新目标！--> 写入库
+        with open(db_file, 'a', encoding='utf-8') as f:
+            f.write("\n".join(new_data_lines) + "\n")
+            
+        # 激进策略：如果有新数据，立刻缩短检查间隔，以此追踪爆发期
+        # 最小 10 分钟 (600s)
+        new_interval = max(600, int(current_interval * 0.5))
+    else:
+        # 无新数据 --> 逐步冷却，节省资源
+        # 最大 12 小时 (43200s)
+        new_interval = min(43200, int(current_interval * 1.5))
+
+    # 更新任务状态
+    task['last_run'] = int(time.time())
+    task['interval'] = new_interval
+    save_monitor_tasks()
+    
+    # 4. 安排下一次运行 (Add Jitter: +/- 10%)
+    jitter = random.randint(int(-new_interval * 0.1), int(new_interval * 0.1))
+    next_run_delay = new_interval + jitter
+    
+    context.job_queue.run_once(run_monitor_execution_job, next_run_delay, context={"task_id": task_id}, name=f"monitor_{task_id}")
+
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
@@ -973,7 +1242,7 @@ def query_entry_point(update: Update, context: CallbackContext):
                 message_obj.reply_text("👋 欢迎！作为首次使用的访客，请输入您的FOFA API Key以继续。您的Key只会被您自己使用。")
                 if context.args:
                     context.user_data['pending_query'] = " ".join(context.args)
-                return STATE_GET_GUEST_KEY
+                return QUERY_STATE_GET_GUEST_KEY
             context.user_data['guest_key'] = guest_key
 
         if not context.args:
@@ -1021,7 +1290,7 @@ def get_guest_key(update: Update, context: CallbackContext):
     data, error = verify_fofa_api(guest_key)
     if error:
         msg.edit_text(f"❌ Key验证失败: {error}\n请重新输入一个有效的Key，或使用 /cancel 取消。")
-        return STATE_GET_GUEST_KEY
+        return QUERY_STATE_GET_GUEST_KEY
     ANONYMOUS_KEYS[str(user_id)] = guest_key
     save_anonymous_keys()
     msg.edit_text(f"✅ Key验证成功 ({data.get('username', 'N/A')})！您的Key已保存，现在可以开始查询了。")
@@ -1934,7 +2203,7 @@ def show_api_menu(update: Update, context: CallbackContext, force_check=False):
         [InlineKeyboardButton("🔄 状态检查", callback_data='action_check_api'), InlineKeyboardButton("🔙 返回", callback_data='action_back')]
     ]
     query.message.edit_text("\n".join(api_list_text), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_SETTINGS_ACTION
+    return SETTINGS_STATE_ACTION
 def get_key(update: Update, context: CallbackContext):
     new_key = update.message.text.strip()
     if new_key in CONFIG['apis']:
@@ -2041,7 +2310,7 @@ def show_update_menu(update: Update, context: CallbackContext):
     text = f"🔄 *脚本更新设置*\n\n当前更新URL: `{escape_markdown_v2(url)}`"
     keyboard = [[InlineKeyboardButton("✏️ 设置URL", callback_data='update_set_url'), InlineKeyboardButton("🔙 返回", callback_data='update_back')]]
     query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_SETTINGS_ACTION
+    return SETTINGS_STATE_ACTION
 def get_update_url(update: Update, context: CallbackContext):
     url = update.message.text.strip()
     if url.lower().startswith('http'): CONFIG['update_url'] = url; save_config(); update.message.reply_text("✅ 更新URL已设置。")
@@ -2052,7 +2321,7 @@ def show_backup_restore_menu(update: Update, context: CallbackContext):
     text = "💾 *备份与恢复*\n\n\\- *备份*: 发送当前的 `config\\.json` 文件给您。\n\\- *恢复*: 您需要向机器人发送一个 `config\\.json` 文件来覆盖当前配置。"
     keyboard = [[InlineKeyboardButton("📤 备份", callback_data='backup_now'), InlineKeyboardButton("📥 恢复", callback_data='restore_now')], [InlineKeyboardButton("🔙 返回", callback_data='backup_back')]]
     query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-    return STATE_SETTINGS_ACTION
+    return SETTINGS_STATE_ACTION
 def show_proxypool_menu(update: Update, context: CallbackContext):
     query = update.callback_query
     proxies = CONFIG.get("proxies", [])
@@ -2102,8 +2371,8 @@ def show_upload_api_menu(update: Update, context: CallbackContext):
 def upload_api_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); action = query.data.split('_', 1)[1]
     if action == 'back': return settings_command(update, context)
-    if action == 'set_url': query.message.edit_text("请输入您的上传接口 URL:"); return STATE_GET_UPLOAD_URL
-    if action == 'set_token': query.message.edit_text("请输入您的上传接口 Token:"); return STATE_GET_UPLOAD_TOKEN
+    if action == 'set_url': query.message.edit_text("请输入您的上传接口 URL:"); return SETTINGS_STATE_GET_UPLOAD_URL
+    if action == 'set_token': query.message.edit_text("请输入您的上传接口 Token:"); return SETTINGS_STATE_GET_UPLOAD_TOKEN
     return SETTINGS_STATE_UPLOAD_API_MENU
 def get_upload_url(update: Update, context: CallbackContext):
     url = update.message.text.strip()
@@ -2253,7 +2522,7 @@ def allfofa_get_limit(update: Update, context: CallbackContext):
             assert limit > 0
         except (ValueError, AssertionError):
             update.message.reply_text("❌ 无效的数字，请输入一个正整数。")
-            return STATE_ALLFOFA_GET_LIMIT
+            return QUERY_STATE_ALLFOFA_GET_LIMIT
         msg_target = update.message
 
     context.user_data['limit'] = limit
@@ -2264,92 +2533,183 @@ def allfofa_get_limit(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 def run_allfofa_download_job(context: CallbackContext):
+    """
+    智能剥离下载器 (Smart Peeling + Time Slicing)
+    核心策略: 
+    1. 循环检测当前Query的数据量。
+    2. >10000: 取 Top1 国家，拆分为 Slice (该国家) 和 Remaining (非该国家)。
+       对 Slice 使用 Time Traceback 暴力下载。
+       对 Remaining 进入下一次循环。
+    3. <10000: 直接普通翻页下载。
+    """
     job_data = context.job.context
-    bot, chat_id, query_text = context.bot, job_data['chat_id'], job_data['query']
-    limit, total_size = job_data.get('limit'), job_data.get('total_size')
-
-    # v10.9.4 FIX: Receive the locked-in key AND proxy session from the pre-check.
-    start_key = job_data.get('start_key')
+    bot, chat_id = context.bot, job_data['chat_id']
+    limit = job_data.get('limit')
+    
+    # 原始查询
+    original_query = job_data['query']
+    
+    # 使用锁定的 Key 和 Proxy Session (从 allfofa command 初始化传过来的)
+    current_key = job_data.get('start_key') 
     proxy_session = job_data.get('proxy_session')
 
-    initial_results = job_data.get('initial_results', [])
-    initial_next_id = job_data.get('initial_next_id')
+    if not current_key:
+        bot.send_message(chat_id, "❌ 内部错误：任务上下文丢失 Key 信息。")
+        return
 
-    if not start_key or KEY_LEVELS.get(start_key, -1) == -1:
-        bot.send_message(chat_id, "❌ 任务失败：没有可用的有效API Key或起始Key无效。")
+    # 输出文件名管理
+    output_filename = generate_filename_from_query(original_query, prefix="smart_all")
+    cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
+    
+    # 用于显示的进度更新
+    msg = bot.send_message(chat_id, "🚀 智能剥离引擎已启动...\n正在分析数据分布...")
+    stop_flag = f'stop_job_{chat_id}'
+    
+    current_query_scope = original_query
+    collected_results = set() # 为了最后去重 (海量数据内存是个问题，但对于set str通常还能接受，如果百万级考虑落盘去重)
+    
+    loop_count = 0
+    start_time = time.time()
+    last_ui_update = 0
+
+    try:
+        while True:
+            loop_count += 1
+            if context.bot_data.get(stop_flag):
+                msg.edit_text("🌀 任务已收到停止信号，正在中止...")
+                break
+                
+            if limit and len(collected_results) >= limit:
+                break
+
+            # 1. 估算当前 Scope 大小
+            data_size_chk, error = fetch_fofa_data(current_key, current_query_scope, page_size=1, fields="host", proxy_session=proxy_session)
+            if error: 
+                msg.edit_text(f"❌ 侦查失败: {error}")
+                break
+            
+            scope_size = data_size_chk.get('size', 0)
+            
+            # --- 阶段 A: 小数据量直接吞噬 ---
+            if scope_size <= 10000: # 小于1万，一锅端
+                if loop_count == 1: 
+                    msg.edit_text(f"🔍 数据量 ({scope_size}) 小于单次限制，直接下载...")
+                
+                # 普通翻页获取 (Normal Page Iteration)
+                pages = (scope_size + 9999) // 10000
+                for p in range(1, pages + 1):
+                    # 获取
+                    d, e = fetch_fofa_data(current_key, current_query_scope, page=p, page_size=10000, fields="host", proxy_session=proxy_session)
+                    if not e and d.get('results'):
+                        collected_results.update([r for r in d.get('results') if isinstance(r, str) and ':' in r])
+                    
+                    # 进度UI
+                    if time.time() - last_ui_update > 3:
+                        msg.edit_text(f"📥 直接下载中... (已收录: {len(collected_results)})")
+                        last_ui_update = time.time()
+                        
+                break # 当前剩余的所有都在这一轮被拿走了，大循环结束
+
+            # --- 阶段 B: 大数据量空间剥离 (Country Slicing) ---
+            # 获取 Top1 国家
+            stats_data, e = fetch_fofa_stats(current_key, current_query_scope, proxy_session=proxy_session)
+            if e: 
+                msg.edit_text(f"❌ 聚合分析失败: {e}")
+                break
+            
+            aggs = stats_data.get("aggs", stats_data)
+            countries = aggs.get("countries", [])
+            
+            if not countries:
+                # 极端情况：查到了Size但没有Stats国家？可能是IP类型。
+                # 强制进入时间切片模式 (Blind Traceback)
+                top_country_code = None
+            else:
+                top_country_code = countries[0].get('name') # e.g., "US" or "CN"
+            
+            # 构造切片查询
+            if top_country_code:
+                slice_query = f'({current_query_scope}) && country="{top_country_code}"'
+                # 剩余部分 = 当前Scope && 不等于 Top1
+                next_round_query = f'({current_query_scope}) && country!="{top_country_code}"'
+                slice_desc = f"国家={top_country_code}"
+            else:
+                # 如果没法按国家分，那就整个当做一块肉，尝试硬切 (fallback to Time Trace on whole query)
+                slice_query = current_query_scope
+                next_round_query = None # 没有下一轮了，这是最后一搏
+                slice_desc = "全部剩余数据"
+
+            # 对 Slice 使用深度追溯下载 (Time Peeling)
+            # 用户核心策略：复用深度追溯，利用时间轴把这个巨大的 slice 扒下来
+            trace_count_added = 0
+            iterator = iter_fofa_traceback(current_key, slice_query, limit=limit, proxy_session=proxy_session)
+            
+            for batch in iterator:
+                if context.bot_data.get(stop_flag): break
+                
+                # 批量添加
+                valid_items = [item[0] for item in batch if item and isinstance(item, list) and len(item)>0]
+                new_items_count = 0
+                for item in valid_items:
+                    if item not in collected_results:
+                        collected_results.add(item)
+                        new_items_count += 1
+                        
+                trace_count_added += new_items_count
+                
+                if time.time() - last_ui_update > 3:
+                    try:
+                        prog_bar = create_progress_bar(min(len(collected_results) / (limit or (len(collected_results)+100000)) * 100, 100))
+                        msg.edit_text(
+                            f"✂️ *正在剥离数据块:* `{slice_desc}`\n"
+                            f"📉 策略: 时间轴降维打击 (Time Trace)\n"
+                            f"{prog_bar} 总数: {len(collected_results)}\n"
+                            f"(本轮新增: {trace_count_added})",
+                            parse_mode=ParseMode.MARKDOWN_V2
+                        )
+                    except Exception: pass
+                    last_ui_update = time.time()
+                
+                if limit and len(collected_results) >= limit: break
+            
+            if not next_round_query or context.bot_data.get(stop_flag):
+                break
+                
+            # 准备进入下一轮，处理被排除了 Top1 后的剩余世界
+            current_query_scope = next_round_query
+            # 防止无限死循环保护 (例如 Stats 返回空但Size > 0)
+            if loop_count > 50:
+                msg.edit_text("⚠️ 警告：智能剥离循环次数过多，自动停止以防死锁。")
+                break
+
+    except Exception as e:
+        logger.error(f"Smart download fatal error: {e}", exc_info=True)
+        msg.edit_text(f"❌ 任务发生严重错误: {e}")
         return
     
-    current_key = start_key
-    output_filename = generate_filename_from_query(query_text, prefix="allfofa")
+    # 结果交付
+    final_limit_msg = ""
+    if limit and len(collected_results) >= limit: final_limit_msg = f" (已达上限 {limit})"
     
-    unique_results = set(res for res in initial_results if isinstance(res, str) and ':' in res)
-    
-    stop_flag = f'stop_job_{chat_id}'
-    msg = bot.send_message(chat_id, "⏳ 开始使用 `next` 接口进行海量下载...")
-    
-    next_id, termination_reason, last_update_time = initial_next_id, "", 0
-
-    if not next_id:
-        termination_reason = "\n\nℹ️ 已获取所有查询结果 (仅有一页数据)."
-    elif limit and len(unique_results) >= limit:
-        unique_results = set(list(unique_results)[:limit])
-        termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限 (仅有一页数据)。"
-        next_id = None
-
-    while next_id:
-        if context.bot_data.get(stop_flag):
-            termination_reason = "\n\n🌀 任务已手动停止."
-            break
-
-        # v10.9.4 FIX: Use the locked-in proxy for all subsequent `next` calls.
-        data, error = fetch_fofa_next_data(current_key, query_text, next_id=next_id, fields="host", proxy_session=proxy_session)
-
-        if error:
-            termination_reason = f"\n\n❌ 下载过程中出错: {escape_markdown_v2(error)}"
-            break
-        
-        results = data.get('results', [])
-        if not results:
-            termination_reason = "\n\nℹ️ 已获取所有查询结果."
-            break
-        
-        unique_results.update(res for res in results if isinstance(res, str) and ':' in res)
-
-        if limit and len(unique_results) >= limit:
-            unique_results = set(list(unique_results)[:limit])
-            termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"
-            break
-
-        current_time = time.time()
-        if current_time - last_update_time > 2:
-            try:
-                progress_bar = create_progress_bar(len(unique_results) / (limit or total_size) * 100)
-                msg.edit_text(f"下载进度: {progress_bar} ({len(unique_results)} / {limit or total_size})")
-            except (BadRequest, RetryAfter, TimedOut):
-                pass
-            last_update_time = current_time
-
-        next_id = data.get('next')
-        if not next_id:
-            termination_reason = "\n\nℹ️ 已获取所有查询结果 (API未返回next_id)."
-            break
-
-    if unique_results:
-        with open(output_filename, 'w', encoding='utf-8') as f:
-            f.write("\n".join(sorted(list(unique_results))))
-        
-        msg.edit_text(f"✅ 海量下载完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-        cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
-        shutil.move(output_filename, cache_path)
-        
-        send_file_safely(context, chat_id, cache_path, filename=output_filename)
-        
+    if collected_results:
+        # 排序并写入文件
+        sorted_results = sorted(list(collected_results))
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(sorted_results))
+            
+        final_caption = f"✅ *海量下载完成*\n\n🎯 原始查询: `{escape_markdown_v2(original_query)}`\n🔢 最终获取: *{len(collected_results)}* 条{escape_markdown_v2(final_limit_msg)}\n⏱ 耗时: {int(time.time()-start_time)}s"
+        send_file_safely(context, chat_id, cache_path, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
         upload_and_send_links(context, chat_id, cache_path)
-        cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
-        add_or_update_query(query_text, cache_data)
-        offer_post_download_actions(context, chat_id, query_text)
+        
+        # 本地记录更新
+        cache_entry = {'file_path': cache_path, 'result_count': len(collected_results)}
+        add_or_update_query(original_query, cache_entry)
+        
+        offer_post_download_actions(context, chat_id, original_query)
+        msg.delete() # 删掉进度条
+        
     else:
-        msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据\\.{termination_reason}", parse_mode=ParseMode.MARKDOWN_V2)
+        msg.edit_text("🤷‍♀️ 任务结束，未收集到有效数据。")
     
     context.bot_data.pop(stop_flag, None)
 
@@ -2535,8 +2895,20 @@ def main() -> None:
     scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={SCAN_STATE_GET_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], SCAN_STATE_GET_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
     batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={BATCHCHECKAPI_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
-    dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command)); dispatcher.add_handler(InlineQueryHandler(inline_fofa_handler)); 
+    dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command)); dispatcher.add_handler(CommandHandler("monitor", monitor_command)) # 注册监控命令
+    dispatcher.add_handler(InlineQueryHandler(inline_fofa_handler)); 
     
+    # --- 恢复监控任务 ---
+    if MONITOR_TASKS:
+        count = 0
+        for task_id, task in MONITOR_TASKS.items():
+            if task.get('status') == 'active':
+                # 计算初始延迟：分散启动，避免洪峰 (0 - 60s)
+                delay = random.randint(5, 60)
+                updater.job_queue.run_once(run_monitor_execution_job, delay, context={"task_id": task_id, "is_restore": True}, name=f"monitor_{task_id}")
+                count += 1
+        logger.info(f"已恢复 {count} 个监控任务。")
+
     # --- 主菜单按钮处理器 (v10.9.6) ---
     menu_conv = ConversationHandler(
         entry_points=[
