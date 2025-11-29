@@ -62,6 +62,7 @@ CONTINENT_COUNTRIES = {
     'Africa': ['DZ', 'AO', 'BJ', 'BW', 'BF', 'BI', 'CV', 'CM', 'CF', 'TD', 'KM', 'CD', 'CG', 'CI', 'DJ', 'EG', 'GQ', 'ER', 'SZ', 'ET', 'GA', 'GM', 'GH', 'GN', 'GW', 'KE', 'LS', 'LR', 'LY', 'MG', 'MW', 'ML', 'MR', 'MU', 'YT', 'MA', 'MZ', 'NA', 'NE', 'NG', 'RW', 'ST', 'SN', 'SC', 'SL', 'SO', 'ZA', 'SS', 'SD', 'TZ', 'TG', 'TN', 'UG', 'EH', 'ZM', 'ZW'],
     'Oceania': ['AS', 'AU', 'CK', 'FJ', 'PF', 'GU', 'KI', 'MH', 'FM', 'NR', 'NC', 'NZ', 'NU', 'NF', 'MP', 'PW', 'PG', 'PN', 'WS', 'SB', 'TK', 'TO', 'TV', 'VU', 'WF']
 }
+ALL_COUNTRY_CODES = sorted(list(set(code for countries in CONTINENT_COUNTRIES.values() for code in countries)))
 
 # --- FOFA 字段定义 ---
 FOFA_STATS_FIELDS = "protocol,domain,port,title,os,server,country,asn,org,asset_type,fid,icp"
@@ -160,11 +161,14 @@ CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
 HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
 ANONYMOUS_KEYS = load_json_file(ANONYMOUS_KEYS_FILE, {})
 SCAN_TASKS = load_json_file(SCAN_TASKS_FILE, {})
+MONITOR_TASKS = load_json_file(MONITOR_TASKS_FILE, {}) # 加载监控任务
 def save_config(): save_json_file(CONFIG_FILE, CONFIG)
 def save_anonymous_keys(): save_json_file(ANONYMOUS_KEYS_FILE, ANONYMOUS_KEYS)
 def save_scan_tasks():
     logger.info(f"Saving {len(SCAN_TASKS)} scan tasks to {SCAN_TASKS_FILE}")
     save_json_file(SCAN_TASKS_FILE, SCAN_TASKS)
+def save_monitor_tasks():
+    save_json_file(MONITOR_TASKS_FILE, MONITOR_TASKS)
 def add_or_update_query(query_text, cache_data=None):
     existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
     if existing_query:
@@ -728,6 +732,100 @@ def run_full_download_query(context: CallbackContext):
         add_or_update_query(query_text, cache_data); offer_post_download_actions(context, chat_id, query_text)
     elif not context.bot_data.get(stop_flag): msg.edit_text("🤷‍♀️ 任务完成，但未能下载到任何数据。")
     context.bot_data.pop(stop_flag, None)
+
+def run_sharded_download_job(context: CallbackContext):
+    """
+    智能分片下载任务：按国家代码将查询拆分，绕过单次查询10000条的限制。
+    """
+    job_data = context.job.context
+    bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']
+    
+    output_filename = generate_filename_from_query(base_query, prefix="sharded")
+    unique_results = set()
+    stop_flag = f'stop_job_{chat_id}'
+    
+    msg = bot.send_message(chat_id, f"⏳ *启动智能分片下载*\n目标：将查询按 {len(ALL_COUNTRY_CODES)} 个国家区域拆分...\n注意：此模式将消耗较多的 API 请求次数。", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    start_time = time.time()
+    last_ui_update_time = 0
+    total_codes = len(ALL_COUNTRY_CODES)
+    
+    # 遍历所有国家
+    for i, country_code in enumerate(ALL_COUNTRY_CODES):
+        if context.bot_data.get(stop_flag):
+            try: msg.edit_text("🛑 任务已手动停止。")
+            except (BadRequest, RetryAfter, TimedOut): pass
+            break
+            
+        current_time = time.time()
+        # 更新进度UI (每2秒最多更新一次)
+        if current_time - last_ui_update_time > 2 or i == 0:
+            elapsed = current_time - start_time
+            speed = len(unique_results) / elapsed if elapsed > 0 else 0
+            progress_bar = create_progress_bar((i / total_codes) * 100)
+            try:
+                msg.edit_text(
+                    f"🌍 *正在分片扫描...* `{country_code}`\n"
+                    f"{progress_bar} {i}/{total_codes}\n"
+                    f"已收集数据: *{len(unique_results)}* 条\n"
+                    f"当前平均速度: *{int(speed)}* 条/秒",
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+                last_ui_update_time = current_time
+            except (BadRequest, RetryAfter, TimedOut):
+                pass
+
+        # 构造分片查询
+        sharded_query = f'({base_query}) && country="{country_code}"'
+        
+        # 内部查询函数
+        def query_logic(key, key_level, proxy_session):
+            # 为了节省流量和速度，默认只请求第一页 (max 10000 per country is usually enough for most cases)
+            return fetch_fofa_data(key, sharded_query, page=1, page_size=10000, fields="host", proxy_session=proxy_session)
+
+        # 尝试查询
+        guest_key = job_data.get('guest_key')
+        if guest_key:
+            data, error = fetch_fofa_data(guest_key, sharded_query, page=1, page_size=10000, fields="host")
+        else:
+            data, _, _, _, _, error = execute_query_with_fallback(query_logic)
+        
+        # 处理结果
+        if not error and data and data.get('results'):
+            new_data = data['results']
+            # 处理简单字符串结果或列表结果
+            extracted_hosts = []
+            if new_data and isinstance(new_data[0], list):
+                 extracted_hosts = [r[0] for r in new_data if r and r[0] and ':' in r[0]]
+            else:
+                 extracted_hosts = [r for r in new_data if isinstance(r, str) and ':' in r]
+            
+            unique_results.update(extracted_hosts)
+            
+            # (可选优化) 如果单个国家结果也是满的 10000，理想情况应该再对该国家按 region 分片
+            # 但这里为了避免无限递归，暂时接受单个分片 10000 的上限。对于绝大多数国家已足够。
+
+    # 循环结束后的收尾
+    context.bot_data.pop(stop_flag, None)
+    
+    if unique_results:
+        final_count = len(unique_results)
+        msg.edit_text(f"✅ 分片扫描完成！\n总计发现 *{final_count}* 条唯一数据。\n正在生成并发送文件...", parse_mode=ParseMode.MARKDOWN_V2)
+        
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            f.write("\n".join(sorted(list(unique_results))))
+            
+        cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
+        shutil.move(output_filename, cache_path)
+        send_file_safely(context, chat_id, cache_path, filename=output_filename)
+        upload_and_send_links(context, chat_id, cache_path)
+        
+        cache_data = {'file_path': cache_path, 'result_count': final_count}
+        add_or_update_query(base_query, cache_data)
+        offer_post_download_actions(context, chat_id, base_query)
+    else:
+        msg.edit_text("🤷‍♀️ 任务完成，但在任何国家分片中都未找到数据。")
+
 def run_traceback_download_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; limit = job_data.get('limit')
     output_filename = generate_filename_from_query(base_query); unique_results, page_count, last_page_date, termination_reason, stop_flag, last_update_time = set(), 0, None, "", f'stop_job_{chat_id}', 0
@@ -1400,16 +1498,24 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
         return ConversationHandler.END
     else:
         keyboard = [
-            [InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback')],
-            [InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]
+            [InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌍 分片下载 (突破上限)", callback_data='mode_sharding')],
+            [InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback'), InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]
         ]
-        msg.edit_text(f"{success_message}\n请选择下载模式:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
-        # 修复了拼写错误 KKFA -> KKFOFA
+        msg.edit_text(f"{success_message}\n检测到大量结果 ({total_size}条)。由于单次查询上限 (10,000)，您可以：\n\n1️⃣ **前1万**：仅下载最近的1万条。\n2️⃣ **分片下载**：按国家自动拆分，尽可能通过积少成多突破1万条限制 (消耗更多请求)。\n3️⃣ **深度追溯**：按时间回溯 (需高等级Key)。", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
         return QUERY_STATE_KKFOFA_MODE 
 
 def query_mode_callback(update: Update, context: CallbackContext):
     query = update.callback_query; query.answer(); mode = query.data.split('_')[1]
     if mode == 'cancel': query.message.edit_text("操作已取消."); return ConversationHandler.END
+    
+    if mode == 'sharding':
+        if context.user_data.get('is_batch_mode'):
+             query.message.edit_text("⚠️ 抱歉，分片下载目前仅支持基础 Host 导出，不支持自定义批量字段。")
+             return ConversationHandler.END
+        start_download_job(context, run_sharded_download_job, context.user_data)
+        query.message.delete()
+        return ConversationHandler.END
+
     if mode == 'traceback':
         keyboard = [[InlineKeyboardButton("♾️ 全部获取", callback_data='limit_none')], [InlineKeyboardButton("❌ 取消", callback_data='limit_cancel')]]
         query.message.edit_text("请输入深度追溯获取的结果数量上限 (例如: 50000)，或选择全部获取。", reply_markup=InlineKeyboardMarkup(keyboard))
