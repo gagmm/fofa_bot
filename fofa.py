@@ -1501,7 +1501,15 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
             [InlineKeyboardButton("💎 全部下载 (前1万)", callback_data='mode_full'), InlineKeyboardButton("🌍 分片下载 (突破上限)", callback_data='mode_sharding')],
             [InlineKeyboardButton("🌀 深度追溯下载", callback_data='mode_traceback'), InlineKeyboardButton("❌ 取消", callback_data='mode_cancel')]
         ]
-        msg.edit_text(f"{success_message}\n检测到大量结果 ({total_size}条)。由于单次查询上限 (10,000)，您可以：\n\n1️⃣ **前1万**：仅下载最近的1万条。\n2️⃣ **分片下载**：按国家自动拆分，尽可能通过积少成多突破1万条限制 (消耗更多请求)。\n3️⃣ **深度追溯**：按时间回溯 (需高等级Key)。", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+        
+        msg_text = (
+            f"{success_message}\n"
+            f"检测到大量结果 \\({total_size}条\\)\\。由于单次查询上限 \\(10,000\\)，您可以：\n\n"
+            f"1️⃣ *前1万*：仅下载最近的1万条\\。\n"
+            f"2️⃣ *分片下载*：按国家自动拆分，尽可能通过积少成多突破1万条限制 \\(消耗更多请求\\)\\。\n"
+            f"3️⃣ *深度追溯*：按时间回溯 \\(需高等级Key\\)\\。"
+        )
+        msg.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
         return QUERY_STATE_KKFOFA_MODE 
 
 def query_mode_callback(update: Update, context: CallbackContext):
@@ -2418,9 +2426,16 @@ def show_update_menu(update: Update, context: CallbackContext):
     query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     return SETTINGS_STATE_ACTION
 def get_update_url(update: Update, context: CallbackContext):
+    if not update.message or not update.message.text:
+        return SETTINGS_STATE_GET_UPDATE_URL
+        
     url = update.message.text.strip()
-    if url.lower().startswith('http'): CONFIG['update_url'] = url; save_config(); update.message.reply_text("✅ 更新URL已设置。")
-    else: update.message.reply_text("❌ 无效的URL格式。")
+    if url.lower().startswith('http'): 
+        CONFIG['update_url'] = url
+        save_config()
+        update.message.reply_text("✅ 更新URL已设置。")
+    else: 
+        update.message.reply_text("❌ 无效的URL格式。")
     return settings_command(update, context)
 def show_backup_restore_menu(update: Update, context: CallbackContext):
     query = update.callback_query
