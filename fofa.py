@@ -1233,6 +1233,20 @@ def run_monitor_execution_job(context: CallbackContext):
         # 命中新目标！--> 写入库
         with open(db_file, 'a', encoding='utf-8') as f:
             f.write("\n".join(new_data_lines) + "\n")
+        
+        # 发送命中通知
+        try:
+            chat_id = task.get('chat_id')
+            if chat_id:
+                notif_text = (
+                    f"📡 *监控雷达命中* \\(Task: `{task_id}`\\)\n"
+                    f"查询: `{escape_markdown_v2(query_text[:30])}`\\.\\.\\.\n"
+                    f"发现 *{len(new_data_lines)}* 个新目标！\n"
+                    f"已沉淀至本地库，可使用 `/monitor get {task_id}` 提取\\."
+                )
+                context.bot.send_message(chat_id, notif_text, parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception as e:
+            logger.error(f"Failed to send monitor notification: {e}")
             
         # 激进策略：如果有新数据，立刻缩短检查间隔，以此追踪爆发期
         # 最小 10 分钟 (600s)
@@ -2951,7 +2965,7 @@ def main() -> None:
         BotCommand("backup", "📤 备份配置"), BotCommand("restore", "📥 恢复配置"),
         BotCommand("update", "🔄 在线更新脚本"), BotCommand("getlog", "📄 获取日志"),
         BotCommand("shutdown", "🔌 关闭机器人"), BotCommand("stop", "🛑 停止任务"),
-        BotCommand("cancel", "❌ 取消操作")
+        BotCommand("monitor", "📡 监控雷达 (添加/列表/删除)"), BotCommand("cancel", "❌ 取消操作")
     ]
     try: updater.bot.set_my_commands(commands)
     except Exception as e: logger.warning(f"设置机器人命令失败: {e}")
