@@ -1138,8 +1138,8 @@ def monitor_command(update: Update, context: CallbackContext):
             if interval < 3600: dur = f"{interval//60}分"
             else: dur = f"{interval/3600:.1f}小时"
 
-            msg.append(f"📡 `{tid}`: *{escape_markdown_v2(task['query'][:25])}...*")
-            msg.append(f"   📦 库存: *{count}* \| ⏱ 上次: {last_run_str} \| ⏳ 频率: {dur}")
+            msg.append(f"📡 `{tid}`: *{escape_markdown_v2(task['query'][:25] + '...')}*")
+            msg.append(f"   📦 库存: *{count}* \\| ⏱ 上次: {last_run_str} \\| ⏳ 频率: {escape_markdown_v2(dur)}")
             msg.append("") # Spacer
             
         update.message.reply_text("\n".join(msg), parse_mode=ParseMode.MARKDOWN_V2)
