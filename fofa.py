@@ -333,8 +333,9 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_s
             return data, None
         except requests.exceptions.RequestException as e:
             last_error = f"网络请求失败: {e}"
-            logger.error(f"RequestException on attempt {attempt + 1}: {e}")
-            time.sleep(5)
+            wait_time = 5 * (attempt + 1) # 指数退避
+            logger.error(f"RequestException on attempt {attempt + 1}, retrying in {wait_time}s: {e}")
+            time.sleep(wait_time)
         except json.JSONDecodeError as e:
             last_error = f"解析JSON响应失败: {e}"
             break
@@ -1101,7 +1102,9 @@ def monitor_command(update: Update, context: CallbackContext):
             "added_at": int(time.time()),
             "last_run": 0,
             "interval": 3600, # 初始1小时
-            "status": "active"
+            "status": "active",
+            "unnotified_count": 0, # 新增：未通知计数器
+            "notification_threshold": 5000 # 新增：通知阈值
         }
         save_monitor_tasks()
         
@@ -1184,7 +1187,7 @@ def monitor_command(update: Update, context: CallbackContext):
         update.message.reply_text("❌ 未知命令。请使用 `/monitor` 查看帮助。")
 
 def run_monitor_execution_job(context: CallbackContext):
-    """自适应监控雷达核心逻辑"""
+    """自适应监控雷达核心逻辑 (v2)"""
     job_context = context.job.context
     task_id = job_context.get('task_id')
     
@@ -1195,7 +1198,7 @@ def run_monitor_execution_job(context: CallbackContext):
     os.makedirs(MONITOR_DATA_DIR, exist_ok=True)
     db_file = os.path.join(MONITOR_DATA_DIR, f"{task_id}.txt")
     
-    # 1. 载入布隆过滤器（或简易Set）
+    # 1. 载入本地数据库哈希
     known_hashes = set()
     if os.path.exists(db_file):
         try:
@@ -1204,68 +1207,76 @@ def run_monitor_execution_job(context: CallbackContext):
                     line = line.strip()
                     if line: known_hashes.add(hashlib.md5(line.encode()).hexdigest())
         except Exception as e:
-            logger.error(f"Error reading monitor DB: {e}")
+            logger.error(f"读取监控数据库失败: {e}")
 
-    # 2. 执行检测 (Radar Ping)
-    # 策略：默认抓第一页（最新数据）。如果是高速模式，抓前3页。
-    # 我们只关心是否有 NEW 数据来决定频率。
-    
-    # 这里我们只取 fields="host,ip,port"，为了省流量且通用
-    fetch_func = lambda k, kl, ps: fetch_fofa_data(k, query_text, page=1, page_size=100, fields="host", proxy_session=ps)
+    # 2. 执行数据收集 (由“探测”改为“收集”)
+    fetch_func = lambda k, kl, ps: fetch_fofa_data(k, query_text, page=1, page_size=5000, fields="host", proxy_session=ps)
     data, _, _, _, _, error = execute_query_with_fallback(fetch_func)
     
     new_data_lines = []
-    
     if not error and data and data.get('results'):
         results = data.get('results')
         for item in results:
             line_str = item[0] if isinstance(item, list) else str(item)
-            h = hashlib.md5(line_str.strip().encode()).hexdigest()
+            line_str = line_str.strip()
+            if not line_str: continue
+            h = hashlib.md5(line_str.encode()).hexdigest()
             if h not in known_hashes:
-                new_data_lines.append(line_str.strip())
+                new_data_lines.append(line_str)
+                known_hashes.add(h) # 在会话中也添加，防止单次查询内重复
                 
-    # 3. 自适应调频算法 (Adaptive Frequency)
-    # 基础频率
-    base_interval = 3600 
-    current_interval = task.get('interval', base_interval)
-    
-    if len(new_data_lines) > 0:
-        # 命中新目标！--> 写入库
+    # 3. 智能调频与通知
+    num_new_found = len(new_data_lines)
+    current_interval = task.get('interval', 3600)
+    unnotified_count = task.get('unnotified_count', 0)
+    notification_threshold = task.get('notification_threshold', 5000)
+
+    if num_new_found > 0:
+        # 发现新目标，写入数据库
         with open(db_file, 'a', encoding='utf-8') as f:
             f.write("\n".join(new_data_lines) + "\n")
         
-        # 发送命中通知
-        try:
-            chat_id = task.get('chat_id')
-            if chat_id:
-                notif_text = (
-                    f"📡 *监控雷达命中* \\(Task: `{task_id}`\\)\n"
-                    f"查询: `{escape_markdown_v2(query_text[:30])}`\\.\\.\\.\n"
-                    f"发现 *{len(new_data_lines)}* 个新目标！\n"
-                    f"已沉淀至本地库，可使用 `/monitor get {task_id}` 提取\\."
-                )
-                context.bot.send_message(chat_id, notif_text, parse_mode=ParseMode.MARKDOWN_V2)
-        except Exception as e:
-            logger.error(f"Failed to send monitor notification: {e}")
-            
-        # 激进策略：如果有新数据，立刻缩短检查间隔，以此追踪爆发期
-        # 最小 10 分钟 (600s)
-        new_interval = max(600, int(current_interval * 0.5))
+        unnotified_count += num_new_found
+        
+        # 检查是否达到通知阈值
+        if unnotified_count >= notification_threshold:
+            try:
+                chat_id = task.get('chat_id')
+                if chat_id:
+                    notif_text = (
+                        f"📡 *监控雷达命中* \\(Task: `{task_id}`\\)\n"
+                        f"查询: `{escape_markdown_v2(query_text[:30])}`\\.\\.\\.\n"
+                        f"发现 *{unnotified_count}* 个新目标！\n"
+                        f"已沉淀至本地库，可使用 `/monitor get {task_id}` 提取\\."
+                    )
+                    context.bot.send_message(chat_id, notif_text, parse_mode=ParseMode.MARKDOWN_V2)
+                    unnotified_count = 0 # 重置计数器
+            except Exception as e:
+                logger.error(f"发送监控通知失败: {e}")
+
+        # 智能调频：根据本次发现数量调整下次间隔
+        if num_new_found < 100: # 少量发现，说明不是爆发期
+            new_interval = min(43200, int(current_interval * 1.2)) # 稍微延长
+        else: # 大量发现，说明是爆发期
+            new_interval = max(600, int(current_interval * 0.7)) # 缩短间隔
     else:
-        # 无新数据 --> 逐步冷却，节省资源
-        # 最大 12 小时 (43200s)
+        # 无新数据，进入冷却，延长间隔
         new_interval = min(43200, int(current_interval * 1.5))
 
     # 更新任务状态
     task['last_run'] = int(time.time())
     task['interval'] = new_interval
+    task['unnotified_count'] = unnotified_count
     save_monitor_tasks()
     
-    # 4. 安排下一次运行 (Add Jitter: +/- 10%)
+    # 4. 安排下一次运行 (加入抖动，并处理 RuntimeError)
     jitter = random.randint(int(-new_interval * 0.1), int(new_interval * 0.1))
     next_run_delay = new_interval + jitter
     
-    context.job_queue.run_once(run_monitor_execution_job, next_run_delay, context={"task_id": task_id}, name=f"monitor_{task_id}")
+    try:
+        context.job_queue.run_once(run_monitor_execution_job, next_run_delay, context={"task_id": task_id}, name=f"monitor_{task_id}")
+    except RuntimeError as e:
+        logger.warning(f"无法安排新的监控任务 (可能正在关闭): {e}")
 
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
