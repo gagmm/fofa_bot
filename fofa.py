@@ -1294,7 +1294,7 @@ def run_monitor_execution_job(context: CallbackContext):
                     notif_text = (
                         f"📡 *监控雷达命中* \\(Task: `{task_id}`\\)\n"
                         f"查询: `{escape_markdown_v2(query_text[:30])}`\\.\\.\\.\n"
-                        f"发现 *{unnotified_count}* 个新目标！\n"
+                        f"发现 *{unnotified_count}* 个新目标\!\n"
                         f"已沉淀至本地库，可使用 `/monitor get {task_id}` 提取\\."
                     )
                     context.bot.send_message(chat_id, notif_text, parse_mode=ParseMode.MARKDOWN_V2)
@@ -1657,19 +1657,19 @@ def format_full_host_report(host_arg, results, fields_list):
     for res_list in results:
         d = _create_dict_from_fofa_result(res_list, fields_list)
         port_info = [f"🌐 *Port `{d.get('port')}` \\({escape_markdown_v2(d.get('protocol', 'N/A'))}\\)*"]
-        if d.get('title'): port_info.append(f"  - *标题:* `{escape_markdown_v2(d.get('title'))}`")
-        if d.get('server'): port_info.append(f"  - *服务:* `{escape_markdown_v2(d.get('server'))}`")
-        if d.get('icp'): port_info.append(f"  - *ICP:* `{escape_markdown_v2(d.get('icp'))}`")
-        if d.get('jarm'): port_info.append(f"  - *JARM:* `{escape_markdown_v2(d.get('jarm'))}`")
+        if d.get('title'): port_info.append(f"  \- *标题:* `{escape_markdown_v2(d.get('title'))}`")
+        if d.get('server'): port_info.append(f"  \- *服务:* `{escape_markdown_v2(d.get('server'))}`")
+        if d.get('icp'): port_info.append(f"  \- *ICP:* `{escape_markdown_v2(d.get('icp'))}`")
+        if d.get('jarm'): port_info.append(f"  \- *JARM:* `{escape_markdown_v2(d.get('jarm'))}`")
         cert_str = d.get('cert', '{}')
         try:
             cert_info = json.loads(cert_str) if isinstance(cert_str, str) and cert_str.startswith('{') else {}
-            if cert_info.get('issuer', {}).get('CN'): port_info.append(f"  - *证书颁发者:* `{escape_markdown_v2(cert_info['issuer']['CN'])}`")
-            if cert_info.get('subject', {}).get('CN'): port_info.append(f"  - *证书使用者:* `{escape_markdown_v2(cert_info['subject']['CN'])}`")
+            if cert_info.get('issuer', {}).get('CN'): port_info.append(f"  \- *证书颁发者:* `{escape_markdown_v2(cert_info['issuer']['CN'])}`")
+            if cert_info.get('subject', {}).get('CN'): port_info.append(f"  \- *证书使用者:* `{escape_markdown_v2(cert_info['subject']['CN'])}`")
         except json.JSONDecodeError:
             pass
-        if d.get('header'): port_info.append(f"  - *Header:* ```\n{d.get('header')}\n```")
-        if d.get('banner'): port_info.append(f"  - *Banner:* ```\n{d.get('banner')}\n```")
+        if d.get('header'): port_info.append(f"  \- *Header:* ```\n{d.get('header')}\n```")
+        if d.get('banner'): port_info.append(f"  \- *Banner:* ```\n{d.get('banner')}\n```")
         report.append("\n".join(port_info))
     return "\n".join(report)
 def host_command_logic(update: Update, context: CallbackContext):
@@ -1766,11 +1766,11 @@ def format_host_details(data):
     details = ["\n\-\-\- *端口详情* \-\-\-"]
     for port_info in data.get('port_details', []):
         port_str = f"\n🌐 *Port `{port_info.get('port')}` \\({escape_markdown_v2(port_info.get('protocol', 'N/A'))}\\)*"
-        if port_info.get('product'): port_str += f"\n  - *产品:* `{escape_markdown_v2(port_info.get('product'))}`"
-        if port_info.get('title'): port_str += f"\n  - *标题:* `{escape_markdown_v2(port_info.get('title'))}`"
-        if port_info.get('jarm'): port_str += f"\n  - *JARM:* `{escape_markdown_v2(port_info.get('jarm'))}`"
-        if port_info.get('banner'): port_str += f"\n  - *Banner:* ```\n{port_info.get('banner')}\n```"
-        details.append(port_str)
+        # 修改点：将所有的 - 改为 \-
+        if port_info.get('product'): port_str += f"\n  \- *产品:* `{escape_markdown_v2(port_info.get('product'))}`"
+        if port_info.get('title'): port_str += f"\n  \- *标题:* `{escape_markdown_v2(port_info.get('title'))}`"
+        if port_info.get('jarm'): port_str += f"\n  \- *JARM:* `{escape_markdown_v2(port_info.get('jarm'))}`"
+        if port_info.get('banner'): port_str += f"\n  \- *Banner:* ```\n{port_info.get('banner')}\n```"        details.append(port_str)
     full_report = summary + "\n".join(details)
     return full_report
 def lowhost_command(update: Update, context: CallbackContext) -> None:
@@ -3083,7 +3083,7 @@ def _build_preview_message(context: CallbackContext, page: int):
     page_results = results[start_index:end_index]
     
     # [ip, port, title]
-    message_parts = [f"📄 *预览: `{escape_markdown_v2(query_text)}`* (第 {page}/{total_pages} 页)\n"]
+    message_parts = [f"📄 *预览: `{escape_markdown_v2(query_text)}`* \(第 {page}/{total_pages} 页\)\n"]
     for item in page_results:
         ip, port, title = item[0], item[1], item[2]
         title_str = escape_markdown_v2(title.strip()) if title else "_无标题_"
