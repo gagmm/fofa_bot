@@ -52,6 +52,7 @@ FOFA_NEXT_URL = "https://fofa.info/api/v1/search/next"
 FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
 FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
 FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
+PREVIEW_PAGE_SIZE = 10 # 预览功能每页条目
 
 # --- 大洲国家代码 ---
 CONTINENT_COUNTRIES = {
@@ -117,7 +118,11 @@ STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
     SETTINGS_STATE_UPLOAD_API_MENU, SETTINGS_STATE_GET_UPLOAD_URL,
     SETTINGS_STATE_GET_UPLOAD_TOKEN, SETTINGS_STATE_ADMIN_MENU,
     SETTINGS_STATE_GET_ADMIN_ID_TO_ADD, SETTINGS_STATE_GET_ADMIN_ID_TO_REMOVE,
-) = range(20, 38)
+    # 新增监控设置
+    SETTINGS_STATE_MONITOR_MENU, SETTINGS_STATE_GET_MONITOR_QUERY_TO_ADD,
+    SETTINGS_STATE_GET_MONITOR_ID_TO_REMOVE, SETTINGS_STATE_GET_MONITOR_ID_TO_CONFIG,
+    SETTINGS_STATE_GET_MONITOR_THRESHOLD
+) = range(20, 43)
 
 # /batch 批量导出流程
 (
@@ -140,6 +145,10 @@ STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
     SCAN_STATE_GET_CONCURRENCY,
     SCAN_STATE_GET_TIMEOUT,
 ) = range(100, 102)
+
+# /preview 预览功能
+PREVIEW_STATE_PAGINATE = 110
+
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -254,9 +263,11 @@ def send_file_safely(context: CallbackContext, chat_id: int, file_path: str, cap
                     timeout=120 
                 )
         else:
+            # 先格式化数字，再转义
+            size_str = escape_markdown_v2(f"{file_size_mb:.2f}")
             message = (
                 f"⚠️ *文件过大*\n\n"
-                f"文件 `{escape_markdown_v2(filename or os.path.basename(file_path))}` \\({file_size_mb:.2f} MB\\) "
+                f"文件 `{escape_markdown_v2(filename or os.path.basename(file_path))}` \\({size_str} MB\\) "
                 f"超过了Telegram的发送限制 \\({TELEGRAM_MAX_FILE_SIZE_MB} MB\\)\\."
             )
             context.bot.send_message(chat_id, message, parse_mode=ParseMode.MARKDOWN_V2)
@@ -527,29 +538,8 @@ async def async_check_port(host, port, timeout):
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError, socket.gaierror): return None
     except Exception: return None
 
-async def async_scanner_orchestrator(targets, concurrency, timeout, mode='tcping', progress_callback=None):
+async def async_scanner_orchestrator(scan_targets, concurrency, timeout, progress_callback=None):
     semaphore = asyncio.Semaphore(concurrency)
-    scan_targets = []
-    if mode == 'tcping':
-        for t in targets:
-            try:
-                host, port_str = t.split(':', 1)
-                scan_targets.append((host, int(port_str)))
-            except (ValueError, IndexError): continue
-    elif mode == 'subnet':
-        subnets_to_ports = {}
-        for line in targets:
-            try:
-                ip_str, port_str = line.strip().split(':'); port = int(port_str)
-                subnet = ".".join(ip_str.split('.')[:3])
-                if subnet not in subnets_to_ports: subnets_to_ports[subnet] = set()
-                subnets_to_ports[subnet].add(port)
-            except ValueError: continue
-        for subnet, ports in subnets_to_ports.items():
-            for i in range(1, 255):
-                for port in ports:
-                    scan_targets.append((f"{subnet}.{i}", port))
-
     total_tasks = len(scan_targets)
     completed_tasks = 0
     
@@ -577,19 +567,76 @@ def run_async_scan_job(context: CallbackContext):
         except (BadRequest, RetryAfter, TimedOut): pass
         return
 
-    try: msg.edit_text("1/3: 正在读取本地缓存文件...")
+    try: msg.edit_text("1/3: 正在解析和加载目标...")
     except (BadRequest, RetryAfter, TimedOut): pass
     
     try:
         with open(cached_item['cache']['file_path'], 'r', encoding='utf-8') as f:
-            targets = [line.strip() for line in f if ':' in line.strip()]
+            raw_targets = [line.strip() for line in f if line.strip()]
     except Exception as e:
         try: msg.edit_text(f"❌ 读取缓存文件失败: {e}")
         except (BadRequest, RetryAfter, TimedOut): pass
         return
+        
+    scan_targets = []
+    scan_type_text = ""
+    if mode == 'tcping':
+        scan_type_text = "TCP存活扫描"
+        for t in raw_targets:
+            try:
+                # Handle URLs with schema
+                if t.startswith('http://') or t.startswith('https://'):
+                    parsed_url = urlparse(t)
+                    hostname = parsed_url.hostname
+                    port = parsed_url.port
+                    if port is None:
+                        port = 443 if parsed_url.scheme == 'https' else 80
+                    if hostname:
+                        # Strip brackets from IPv6 hostnames for socket connection
+                        hostname = hostname.strip("[]")
+                        scan_targets.append((hostname, port))
+                    continue
+                
+                # Handle IPv6 in brackets like [ipv6]:port
+                match = re.match(r'\[([a-fA-F0-9:]+)\]:(\d+)', t)
+                if match:
+                    scan_targets.append((match.group(1), int(match.group(2))))
+                    continue
 
-    scan_type_text = "TCP存活扫描" if mode == 'tcping' else "子网扫描"
-    
+                # Handle host:port (IPv4 or domain)
+                host, port_str = t.rsplit(':', 1)
+                if host and port_str:
+                    scan_targets.append((host, int(port_str)))
+            except (ValueError, IndexError):
+                logger.warning(f"无法解析扫描目标: {t}, 已跳过。")
+                continue
+
+    elif mode == 'subnet':
+        scan_type_text = "子网扫描"
+        subnets_to_ports = {}
+        for line in raw_targets:
+            try:
+                ip_str, port_str = line.strip().split(':'); port = int(port_str)
+                # Basic check for IPv4 before splitting
+                if '.' in ip_str and len(ip_str.split('.')) == 4:
+                    subnet = ".".join(ip_str.split('.')[:3])
+                    if subnet not in subnets_to_ports: subnets_to_ports[subnet] = set()
+                    subnets_to_ports[subnet].add(port)
+                else:
+                    logger.warning(f"子网扫描跳过非IPv4目标: {line}")
+            except ValueError:
+                logger.warning(f"子网扫描无法解析行: {line}")
+                continue
+        for subnet, ports in subnets_to_ports.items():
+            for i in range(1, 255):
+                for port in ports:
+                    scan_targets.append((f"{subnet}.{i}", port))
+
+    if not scan_targets:
+        try: msg.edit_text("🤷‍♀️ 未能从文件中解析出任何有效的目标。请检查文件内容格式。")
+        except (BadRequest, RetryAfter, TimedOut): pass
+        return
+        
     async def main_scan_logic():
         last_update_time = 0
         
@@ -608,13 +655,13 @@ def run_async_scan_job(context: CallbackContext):
                 except (BadRequest, RetryAfter, TimedOut):
                     pass # Ignore if editing fails, continue scanning
 
-        initial_message = f"2/3: 已加载 {len(targets)} 个目标，开始异步{scan_type_text} (并发: {concurrency}, 超时: {timeout}s)..."
+        initial_message = f"2/3: 已加载 {len(scan_targets)} 个有效目标，开始异步{scan_type_text} (并发: {concurrency}, 超时: {timeout}s)..."
         try:
             msg.edit_text(initial_message)
         except (BadRequest, RetryAfter, TimedOut):
             pass
 
-        return await async_scanner_orchestrator(targets, concurrency, timeout, mode, progress_callback)
+        return await async_scanner_orchestrator(scan_targets, concurrency, timeout, progress_callback)
 
     live_results = asyncio.run(main_scan_logic())
     
@@ -767,7 +814,7 @@ def run_sharded_download_job(context: CallbackContext):
             try:
                 msg.edit_text(
                     f"🌍 *正在分片扫描...* `{country_code}`\n"
-                    f"{progress_bar} {i}/{total_codes}\n"
+                    f"{escape_markdown_v2(progress_bar)} {i}/{total_codes}\n"
                     f"已收集数据: *{len(unique_results)}* 条\n"
                     f"当前平均速度: *{int(speed)}* 条/秒",
                     parse_mode=ParseMode.MARKDOWN_V2
@@ -811,7 +858,7 @@ def run_sharded_download_job(context: CallbackContext):
     
     if unique_results:
         final_count = len(unique_results)
-        msg.edit_text(f"✅ 分片扫描完成！\n总计发现 *{final_count}* 条唯一数据。\n正在生成并发送文件...", parse_mode=ParseMode.MARKDOWN_V2)
+        msg.edit_text(f"✅ 分片扫描完成\!\n总计发现 *{final_count}* 条唯一数据。\n正在生成并发送文件\.\.\.", parse_mode=ParseMode.MARKDOWN_V2)
         
         with open(output_filename, 'w', encoding='utf-8') as f:
             f.write("\n".join(sorted(list(unique_results))))
@@ -1093,7 +1140,8 @@ def monitor_command(update: Update, context: CallbackContext):
         task_id = hashlib.md5(query_text.encode()).hexdigest()[:8]
         
         if task_id in MONITOR_TASKS:
-            update.message.reply_text(f"⚠️ 任务已存在 (ID: `{task_id}`)", parse_mode=ParseMode.MARKDOWN_V2)
+            # 修改点：将 ( ) 改为 \( \)
+            update.message.reply_text(f"⚠️ 任务已存在 \(ID: `{task_id}`\)", parse_mode=ParseMode.MARKDOWN_V2)
             return
             
         MONITOR_TASKS[task_id] = {
@@ -1282,15 +1330,6 @@ def run_monitor_execution_job(context: CallbackContext):
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     welcome_text = f'👋 欢迎, {user.first_name}！\n请选择一个操作:'
-    
-    # v10.9.6 FIX: 扩展主菜单并重做工作流程
-    keyboard = [
-        [KeyboardButton("常规搜索"), KeyboardButton("海量搜索")],
-        [KeyboardButton("主机详查"), KeyboardButton("批量导出")],
-        [KeyboardButton("设置"), KeyboardButton("帮助手册")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
     update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
     if not CONFIG['admins']:
@@ -2299,8 +2338,8 @@ def update_script_command(update: Update, context: CallbackContext):
 def settings_command(update: Update, context: CallbackContext):
     keyboard = [
         [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api'), InlineKeyboardButton("✨ 预设管理", callback_data='settings_preset')],
-        [InlineKeyboardButton("🌐 代理池管理", callback_data='settings_proxypool'), InlineKeyboardButton("📤 上传接口设置", callback_data='settings_upload')],
-        [InlineKeyboardButton("👨‍💼 管理员设置", callback_data='settings_admin')],
+        [InlineKeyboardButton("🌐 代理池管理", callback_data='settings_proxypool'), InlineKeyboardButton("📡 监控设置", callback_data='settings_monitor')],
+        [InlineKeyboardButton("📤 上传接口设置", callback_data='settings_upload'), InlineKeyboardButton("👨‍💼 管理员设置", callback_data='settings_admin')],
         [InlineKeyboardButton("💾 备份与恢复", callback_data='settings_backup'), InlineKeyboardButton("🔄 脚本更新", callback_data='settings_update')],
         [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
     ]
@@ -2314,6 +2353,7 @@ def settings_callback_handler(update: Update, context: CallbackContext):
     if menu == 'proxypool': return show_proxypool_menu(update, context)
     if menu == 'backup': return show_backup_restore_menu(update, context)
     if menu == 'preset': return show_preset_menu(update, context)
+    if menu == 'monitor': return show_monitor_menu(update, context)
     if menu == 'update': return show_update_menu(update, context)
     if menu == 'upload': return show_upload_api_menu(update, context)
     if menu == 'admin': return show_admin_menu(update, context)
@@ -2609,6 +2649,134 @@ def get_admin_id_to_remove(update: Update, context: CallbackContext):
     
     return settings_command(update, context)
 
+# --- Monitor Settings Menu ---
+def show_monitor_menu(update: Update, context: CallbackContext):
+    query = getattr(update, 'callback_query', None)
+    
+    msg = ["*📡 监控任务管理*"]
+    
+    tasks = {k: v for k, v in MONITOR_TASKS.items() if v.get('status') == 'active'}
+    
+    if not tasks:
+        msg.append("\n_当前没有活跃的监控任务。_")
+    else:
+        for tid, task in tasks.items():
+            data_file = os.path.join(MONITOR_DATA_DIR, f"{tid}.txt")
+            count = 0
+            if os.path.exists(data_file):
+                try: 
+                    with open(data_file, 'r', encoding='utf-8') as f: count = sum(1 for _ in f)
+                except Exception: pass
+            
+            next_run_str = "未知"
+            jobs = context.job_queue.get_jobs_by_name(f"monitor_{tid}")
+            if jobs:
+                # Use next_t for next run time
+                next_run_dt = jobs[0].next_t
+                if isinstance(next_run_dt, datetime):
+                     next_run_str = next_run_dt.astimezone(tz.tzlocal()).strftime('%H:%M:%S')
+                else: 
+                     next_run_str = "计划中..."
+            else:
+                 last_run = task.get('last_run', 0)
+                 if last_run == 0:
+                     next_run_str = "首次运行"
+                 else:
+                     next_run_str = "已暂停" 
+
+            threshold = task.get('notification_threshold', 5000)
+            
+            query_preview = task['query']
+            if len(query_preview) > 25: query_preview = query_preview[:25] + '...'
+            
+            msg.append(f"\n📡 `{tid}`: *{escape_markdown_v2(query_preview)}*")
+            msg.append(f"   📦 库存: *{count}* \| 通知阈值: *{threshold}*")
+            msg.append(f"   ⏱ 下次运行: *{next_run_str}*")
+
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ 添加", callback_data='monitor_add'),
+            InlineKeyboardButton("➖ 移除", callback_data='monitor_remove'),
+            InlineKeyboardButton("⚙️ 配置", callback_data='monitor_config')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data='monitor_back')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if query:
+        query.message.edit_text("\n".join(msg), reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+    elif update.message:
+        update.message.reply_text("\n".join(msg), reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+        
+    return SETTINGS_STATE_MONITOR_MENU
+
+def monitor_menu_callback(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer(); action = query.data.split('_')[1]
+    if action == 'back': return settings_command(update, context)
+    if action == 'add': 
+        query.message.edit_text("请输入要添加的监控查询语句:"); 
+        return SETTINGS_STATE_GET_MONITOR_QUERY_TO_ADD
+    if action == 'remove': 
+        query.message.edit_text("请输入要移除的监控任务ID:"); 
+        return SETTINGS_STATE_GET_MONITOR_ID_TO_REMOVE
+    if action == 'config':
+        query.message.edit_text("请输入您想配置的监控任务ID:")
+        return SETTINGS_STATE_GET_MONITOR_ID_TO_CONFIG
+
+def get_monitor_query_to_add(update: Update, context: CallbackContext):
+    query_text = update.message.text.strip()
+    task_id = hashlib.md5(query_text.encode()).hexdigest()[:8]
+    if task_id in MONITOR_TASKS:
+        update.message.reply_text(f"⚠️ 任务已存在 (ID: `{task_id}`)", parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        MONITOR_TASKS[task_id] = {
+            "query": query_text, "chat_id": update.effective_chat.id,
+            "added_at": int(time.time()), "last_run": 0, "interval": 3600,
+            "status": "active", "unnotified_count": 0, "notification_threshold": 5000
+        }
+        save_monitor_tasks()
+        context.job_queue.run_once(run_monitor_execution_job, 1, context={"task_id": task_id}, name=f"monitor_{task_id}")
+        update.message.reply_text(f"✅ 监控已添加，ID: `{task_id}`", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    return show_monitor_menu(update, context)
+
+def get_monitor_id_to_remove(update: Update, context: CallbackContext):
+    tid = update.message.text.strip()
+    if tid in MONITOR_TASKS:
+        for job in context.job_queue.get_jobs_by_name(f"monitor_{tid}"):
+            job.schedule_removal()
+        del MONITOR_TASKS[tid]
+        save_monitor_tasks()
+        update.message.reply_text(f"🗑️ 任务 `{tid}` 已停止并移除。", parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        update.message.reply_text("❌ 任务ID不存在。")
+    return show_monitor_menu(update, context)
+
+def get_monitor_id_to_config(update: Update, context: CallbackContext):
+    tid = update.message.text.strip()
+    if tid not in MONITOR_TASKS:
+        update.message.reply_text("❌ 任务ID不存在。请重新输入。")
+        return SETTINGS_STATE_GET_MONITOR_ID_TO_CONFIG
+    context.user_data['config_monitor_id'] = tid
+    task = MONITOR_TASKS[tid]
+    current_threshold = task.get('notification_threshold', 5000)
+    update.message.reply_text(f"正在配置任务 `{tid}`。\n当前通知阈值为: *{current_threshold}*。\n\n请输入新的阈值 \(数字\):", parse_mode=ParseMode.MARKDOWN_V2)
+    return SETTINGS_STATE_GET_MONITOR_THRESHOLD
+
+def get_monitor_threshold(update: Update, context: CallbackContext):
+    try:
+        threshold = int(update.message.text.strip())
+        if threshold < 0: raise ValueError
+        tid = context.user_data.pop('config_monitor_id')
+        MONITOR_TASKS[tid]['notification_threshold'] = threshold
+        save_monitor_tasks()
+        update.message.reply_text(f"✅ 任务 `{tid}` 的通知阈值已更新为 *{threshold}*。", parse_mode=ParseMode.MARKDOWN_V2)
+    except (ValueError, KeyError):
+        update.message.reply_text("❌ 无效输入。请输入一个非负整数。")
+        return SETTINGS_STATE_GET_MONITOR_THRESHOLD
+    return show_monitor_menu(update, context)
+
+
 # --- /allfofa Command Logic ---
 def start_allfofa_search(update: Update, context: CallbackContext, message_to_edit=None):
     query_text = context.user_data['query']
@@ -2806,11 +2974,12 @@ def run_allfofa_download_job(context: CallbackContext):
                 if time.time() - last_ui_update > 3:
                     try:
                         prog_bar = create_progress_bar(min(len(collected_results) / (limit or (len(collected_results)+100000)) * 100, 100))
+                        # 修改点：对 slice_desc 使用 escape_markdown_v2
                         msg.edit_text(
-                            f"✂️ *正在剥离数据块:* `{slice_desc}`\n"
+                            f"✂️ *正在剥离数据块:* `{escape_markdown_v2(slice_desc)}`\n"
                             f"📉 策略: 时间轴降维打击 (Time Trace)\n"
                             f"{prog_bar} 总数: {len(collected_results)}\n"
-                            f"(本轮新增: {trace_count_added})",
+                            f"\(本轮新增: {trace_count_added}\)", # 建议：这里的括号也顺手转义一下，虽然不是必须
                             parse_mode=ParseMode.MARKDOWN_V2
                         )
                     except Exception: pass
@@ -2899,6 +3068,120 @@ def run_host_from_menu(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 
+# --- /preview 命令 (v10.9.7) ---
+def _build_preview_message(context: CallbackContext, page: int):
+    """构建预览消息文本和按钮。"""
+    results = context.user_data.get('preview_results', [])
+    total_pages = context.user_data.get('preview_total_pages', 0)
+    query_text = context.user_data.get('preview_query', 'N/A')
+
+    if not results:
+        return "没有可供预览的结果。", None
+
+    start_index = (page - 1) * PREVIEW_PAGE_SIZE
+    end_index = start_index + PREVIEW_PAGE_SIZE
+    page_results = results[start_index:end_index]
+    
+    # [ip, port, title]
+    message_parts = [f"📄 *预览: `{escape_markdown_v2(query_text)}`* (第 {page}/{total_pages} 页)\n"]
+    for item in page_results:
+        ip, port, title = item[0], item[1], item[2]
+        title_str = escape_markdown_v2(title.strip()) if title else "_无标题_"
+        # 修改点：将 - 修改为 \-
+        message_parts.append(f"`{escape_markdown_v2(ip)}:{port}` \- {title_str}")
+    
+    message = "\n".join(message_parts)
+
+    keyboard_row = []
+    if page > 1:
+        keyboard_row.append(InlineKeyboardButton("⬅️ 上一页", callback_data="preview_prev"))
+    keyboard_row.append(InlineKeyboardButton("❌ 关闭", callback_data="preview_close"))
+    if page < total_pages:
+        keyboard_row.append(InlineKeyboardButton("下一页 ➡️", callback_data="preview_next"))
+    
+    return message, InlineKeyboardMarkup([keyboard_row])
+
+def preview_command(update: Update, context: CallbackContext) -> int:
+    """/preview 和 /p 命令的入口点。"""
+    if not context.args:
+        update.message.reply_text("用法: `/preview <FOFA 查询语句>`\n此命令用于快速预览少量数据。", parse_mode=ParseMode.MARKDOWN_V2)
+        return ConversationHandler.END
+        
+    query_text = " ".join(context.args)
+    msg = update.message.reply_text("⏳ 正在获取预览数据...")
+
+    def query_logic(key, key_level, proxy_session):
+        # 请求50条数据，字段为 ip, port, title
+        return fetch_fofa_data(key, query_text, page=1, page_size=50, fields="ip,port,title", proxy_session=proxy_session)
+
+    data, _, _, _, _, error = execute_query_with_fallback(query_logic, min_level=0)
+
+    if error:
+        msg.edit_text(f"❌ 预览失败: {error}")
+        return ConversationHandler.END
+
+    results = data.get('results', [])
+    if not results:
+        msg.edit_text("🤷‍♀️ 未找到任何结果。")
+        return ConversationHandler.END
+
+    context.user_data['preview_results'] = results
+    context.user_data['preview_query'] = query_text
+    context.user_data['preview_page'] = 1
+    total_pages = (len(results) - 1) // PREVIEW_PAGE_SIZE + 1
+    context.user_data['preview_total_pages'] = total_pages
+
+    message_text, reply_markup = _build_preview_message(context, page=1)
+    
+    msg.edit_text(
+        message_text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+    return PREVIEW_STATE_PAGINATE
+
+def preview_page_callback(update: Update, context: CallbackContext):
+    """处理预览翻页按钮。"""
+    query = update.callback_query
+    query.answer()
+    
+    action = query.data.split('_')[1]
+    
+    current_page = context.user_data.get('preview_page', 1)
+    
+    if action == "close":
+        query.message.edit_text("预览已关闭。")
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    elif action == "next":
+        new_page = current_page + 1
+    elif action == "prev":
+        new_page = current_page - 1
+    else:
+        return PREVIEW_STATE_PAGINATE
+        
+    total_pages = context.user_data.get('preview_total_pages', 0)
+    if not 1 <= new_page <= total_pages:
+        return PREVIEW_STATE_PAGINATE
+
+    context.user_data['preview_page'] = new_page
+    
+    message_text, reply_markup = _build_preview_message(context, page=new_page)
+    
+    try:
+        query.edit_message_text(
+            message_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.error(f"编辑预览消息时出错: {e}")
+
+    return PREVIEW_STATE_PAGINATE
+
 # --- 主函数与调度器 ---
 def interactive_setup():
     """Handles the initial interactive setup for the bot."""
@@ -2967,6 +3250,7 @@ def main() -> None:
     dispatcher.bot_data['updater'] = updater
     commands = [
         BotCommand("start", "🚀 启动机器人"), BotCommand("help", "❓ 命令手册"),
+        BotCommand("preview", "📄 快速预览 (别名 /p)"), BotCommand("p", "📄 快速预览"),
         BotCommand("kkfofa", "🔍 资产搜索 (常规)"), BotCommand("allfofa", "🚚 资产搜索 (海量)"),
         BotCommand("host", "📦 主机详查 (智能)"), BotCommand("lowhost", "🔬 主机速查 (聚合)"),
         BotCommand("stats", "📊 全局聚合统计"), BotCommand("batchfind", "📂 批量智能分析 (Excel)"),
@@ -2996,6 +3280,14 @@ def main() -> None:
             SETTINGS_STATE_ADMIN_MENU: [CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_")],
             SETTINGS_STATE_GET_ADMIN_ID_TO_ADD: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_add)],
             SETTINGS_STATE_GET_ADMIN_ID_TO_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_admin_id_to_remove)],
+            
+            # 监控设置状态
+            SETTINGS_STATE_MONITOR_MENU: [CallbackQueryHandler(monitor_menu_callback, pattern=r"^monitor_")],
+            SETTINGS_STATE_GET_MONITOR_QUERY_TO_ADD: [MessageHandler(Filters.text & ~Filters.command, get_monitor_query_to_add)],
+            SETTINGS_STATE_GET_MONITOR_ID_TO_REMOVE: [MessageHandler(Filters.text & ~Filters.command, get_monitor_id_to_remove)],
+            SETTINGS_STATE_GET_MONITOR_ID_TO_CONFIG: [MessageHandler(Filters.text & ~Filters.command, get_monitor_id_to_config)],
+            SETTINGS_STATE_GET_MONITOR_THRESHOLD: [MessageHandler(Filters.text & ~Filters.command, get_monitor_threshold)],
+
             SETTINGS_STATE_GET_KEY: [MessageHandler(Filters.text & ~Filters.command, get_key)],
             SETTINGS_STATE_REMOVE_API: [MessageHandler(Filters.text & ~Filters.command, remove_api)],
             SETTINGS_STATE_PRESET_MENU: [CallbackQueryHandler(preset_menu_callback, pattern=r"^preset_")],
@@ -3041,6 +3333,16 @@ def main() -> None:
     scan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_scan_callback, pattern=r'^start_scan_')], states={SCAN_STATE_GET_CONCURRENCY: [MessageHandler(Filters.text & ~Filters.command, get_concurrency_callback)], SCAN_STATE_GET_TIMEOUT: [MessageHandler(Filters.text & ~Filters.command, get_timeout_callback)]}, fallbacks=[CommandHandler('cancel', cancel)], conversation_timeout=120)
     batch_check_api_conv = ConversationHandler(entry_points=[CommandHandler("batchcheckapi", batch_check_api_command)], states={BATCHCHECKAPI_STATE_GET_FILE: [MessageHandler(Filters.document.mime_type("text/plain"), receive_api_file)]}, fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=300)
     
+    # 新增预览功能的会话处理器
+    preview_conv = ConversationHandler(
+        entry_points=[CommandHandler("preview", preview_command), CommandHandler("p", preview_command)],
+        states={
+            PREVIEW_STATE_PAGINATE: [CallbackQueryHandler(preview_page_callback, pattern=r"^preview_")]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        conversation_timeout=300
+    )
+
     dispatcher.add_handler(CommandHandler("start", start_command)); dispatcher.add_handler(CommandHandler("help", help_command)); dispatcher.add_handler(CommandHandler("host", host_command)); dispatcher.add_handler(CommandHandler("lowhost", lowhost_command)); dispatcher.add_handler(CommandHandler("check", check_command)); dispatcher.add_handler(CommandHandler("stop", stop_all_tasks)); dispatcher.add_handler(CommandHandler("backup", backup_config_command)); dispatcher.add_handler(CommandHandler("history", history_command)); dispatcher.add_handler(CommandHandler("getlog", get_log_command)); dispatcher.add_handler(CommandHandler("shutdown", shutdown_command)); dispatcher.add_handler(CommandHandler("update", update_script_command)); dispatcher.add_handler(CommandHandler("monitor", monitor_command)) # 注册监控命令
     dispatcher.add_handler(InlineQueryHandler(inline_fofa_handler)); 
     
@@ -3054,27 +3356,7 @@ def main() -> None:
                 updater.job_queue.run_once(run_monitor_execution_job, delay, context={"task_id": task_id, "is_restore": True}, name=f"monitor_{task_id}")
                 count += 1
         logger.info(f"已恢复 {count} 个监控任务。")
-
-    # --- 主菜单按钮处理器 (v10.9.6) ---
-    menu_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(Filters.regex('^常规搜索$'), prompt_for_query),
-            MessageHandler(Filters.regex('^海量搜索$'), prompt_for_query),
-            MessageHandler(Filters.regex('^批量导出$'), prompt_for_query),
-            MessageHandler(Filters.regex('^主机详查$'), prompt_for_host),
-        ],
-        states={
-            STATE_AWAITING_QUERY: [MessageHandler(Filters.text & ~Filters.command, run_query_from_menu)],
-            STATE_AWAITING_HOST: [MessageHandler(Filters.text & ~Filters.command, run_host_from_menu)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        conversation_timeout=300
-    )
-    dispatcher.add_handler(menu_conv)
-    dispatcher.add_handler(MessageHandler(Filters.regex(r'^设置$'), settings_command))
-    dispatcher.add_handler(MessageHandler(Filters.regex(r'^帮助手册$'), help_command))
-
-    dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv)
+    dispatcher.add_handler(settings_conv); dispatcher.add_handler(query_conv); dispatcher.add_handler(batch_conv); dispatcher.add_handler(import_conv); dispatcher.add_handler(stats_conv); dispatcher.add_handler(batchfind_conv); dispatcher.add_handler(restore_conv); dispatcher.add_handler(scan_conv); dispatcher.add_handler(batch_check_api_conv); dispatcher.add_handler(preview_conv)
     
     logger.info(f"🚀 Fofa Bot v10.9 (稳定版) 已启动...")
     updater.start_polling()
