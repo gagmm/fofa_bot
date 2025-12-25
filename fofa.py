@@ -2369,6 +2369,7 @@ def restore_config_command(update: Update, context: CallbackContext):
     update.message.reply_text("请发送您的 `config.json` 或 `.zip` 格式的备份文件。")
     return RESTORE_STATE_GET_FILE
 def receive_config_file(update: Update, context: CallbackContext):
+    global CONFIG
     doc = update.message.document
     file_name = doc.file_name.lower()
     
@@ -2387,7 +2388,6 @@ def receive_config_file(update: Update, context: CallbackContext):
                 zf.extractall('.')
             
             os.remove(zip_path)
-            global CONFIG
             CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
             msg.edit_text("✅ 已从ZIP成功恢复所有配置文件。机器人将自动重启。")
             shutdown_command(update, context, restart=True)
@@ -2401,7 +2401,6 @@ def receive_config_file(update: Update, context: CallbackContext):
     # 恢复单个 config.json
     elif file_name == 'config.json':
         doc.get_file().download(custom_path=CONFIG_FILE)
-        global CONFIG
         CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
         update.message.reply_text("✅ 配置文件已恢复。机器人将自动重启。")
         shutdown_command(update, context, restart=True)
