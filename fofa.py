@@ -1,462 +1,444 @@
 import os
-import logging
+import sys
 import json
+import logging
+import base64
+import time
 import re
-from datetime import datetime
+import requests
+import signal
+import socket
+import hashlib
+import shutil
+import random
+import csv
+import asyncio
+import pandas as pd
+import threading
+import zipfile
+import glob
+import math
 from functools import wraps
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime, timedelta
+from dateutil import tz
+from urllib.parse import urlparse
+import uuid # 确保文件顶部有这行
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode, ReplyKeyboardMarkup, KeyboardButton, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     Updater,
     CommandHandler,
-    MessageHandler,
-    Filters,
     CallbackContext,
     ConversationHandler,
-    CallbackQueryHandler
+    MessageHandler,
+    CallbackQueryHandler,
+    InlineQueryHandler, # <--- 确保有这个
+    Filters,
 )
-import traceback
-import asyncio
-import glob
-import zipfile
-import tempfile
-import math
 
-# --- 全局变量和配置 ---
+from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, InvalidToken
+
+# --- 全局变量和常量 ---
 CONFIG_FILE = 'config.json'
 HISTORY_FILE = 'history.json'
-DEFAULT_CONFIG = {
-    "bot_token": "YOUR_BOT_TOKEN_HERE",
-    "apis": [],
-    "admins": [],
-    "proxy": "",
-    "proxies": [],
-    "full_mode": False,
-    "public_mode": False,
-    "presets": [],
-    "update_url": "",
-    "upload_api_url": "",
-    "upload_api_token": "",
-    "show_download_links": True  # 新增: 控制是否显示下载链接
-}
+LOG_FILE = 'fofa_bot.log'
+FOFA_CACHE_DIR = 'fofa_file'
+ANONYMOUS_KEYS_FILE = 'fofa_anonymous.json'
+SCAN_TASKS_FILE = 'scan_tasks.json'
+MONITOR_TASKS_FILE = 'monitor_tasks.json' # 新增监控配置
+MONITOR_DATA_DIR = 'monitor_data' # 新增监控数据目录
+MAX_HISTORY_SIZE = 50
+MAX_SCAN_TASKS = 50
+CACHE_EXPIRATION_SECONDS = 24 * 60 * 60
+MAX_BATCH_TARGETS = 10000
+FOFA_SEARCH_URL = "https://fofa.info/api/v1/search/all"
+FOFA_NEXT_URL = "https://fofa.info/api/v1/search/next"
+FOFA_INFO_URL = "https://fofa.info/api/v1/info/my"
+FOFA_STATS_URL = "https://fofa.info/api/v1/search/stats"
+FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
+PREVIEW_PAGE_SIZE = 10 # 预览功能每页条目
+TELEGRAM_MAX_FILE_SIZE_BYTES = 48 * 1024 * 1024
 
-# --- 日志记录 ---
+# --- 大洲国家代码 ---
+CONTINENT_COUNTRIES = {
+    'Asia': ['AF', 'AM', 'AZ', 'BH', 'BD', 'BT', 'BN', 'KH', 'CN', 'CY', 'GE', 'IN', 'ID', 'IR', 'IQ', 'IL', 'JP', 'JO', 'KZ', 'KW', 'KG', 'LA', 'LB', 'MY', 'MV', 'MN', 'MM', 'NP', 'KP', 'OM', 'PK', 'PS', 'PH', 'QA', 'SA', 'SG', 'KR', 'LK', 'SY', 'TW', 'TJ', 'TH', 'TL', 'TR', 'TM', 'AE', 'UZ', 'VN', 'YE'],
+    'Europe': ['AL', 'AD', 'AM', 'AT', 'BY', 'BE', 'BA', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FO', 'FI', 'FR', 'GE', 'DE', 'GI', 'GR', 'HU', 'IS', 'IE', 'IT', 'KZ', 'LV', 'LI', 'LT', 'LU', 'MK', 'MT', 'MD', 'MC', 'ME', 'NL', 'NO', 'PL', 'PT', 'RO', 'RU', 'SM', 'RS', 'SK', 'SI', 'ES', 'SE', 'CH', 'TR', 'UA', 'GB', 'VA'],
+    'NorthAmerica': ['AG', 'BS', 'BB', 'BZ', 'CA', 'CR', 'CU', 'DM', 'DO', 'SV', 'GD', 'GT', 'HT', 'HN', 'JM', 'MX', 'NI', 'PA', 'KN', 'LC', 'VC', 'TT', 'US'],
+    'SouthAmerica': ['AR', 'BO', 'BR', 'CL', 'CO', 'EC', 'GY', 'PY', 'PE', 'SR', 'UY', 'VE'],
+    'Africa': ['DZ', 'AO', 'BJ', 'BW', 'BF', 'BI', 'CV', 'CM', 'CF', 'TD', 'KM', 'CD', 'CG', 'CI', 'DJ', 'EG', 'GQ', 'ER', 'SZ', 'ET', 'GA', 'GM', 'GH', 'GN', 'GW', 'KE', 'LS', 'LR', 'LY', 'MG', 'MW', 'ML', 'MR', 'MU', 'YT', 'MA', 'MZ', 'NA', 'NE', 'NG', 'RW', 'ST', 'SN', 'SC', 'SL', 'SO', 'ZA', 'SS', 'SD', 'TZ', 'TG', 'TN', 'UG', 'EH', 'ZM', 'ZW'],
+    'Oceania': ['AS', 'AU', 'CK', 'FJ', 'PF', 'GU', 'KI', 'MH', 'FM', 'NR', 'NC', 'NZ', 'NU', 'NF', 'MP', 'PW', 'PG', 'PN', 'WS', 'SB', 'TK', 'TO', 'TV', 'VU', 'WF']
+}
+ALL_COUNTRY_CODES = sorted(list(set(code for countries in CONTINENT_COUNTRIES.values() for code in countries)))
+
+# --- FOFA 字段定义 ---
+FOFA_STATS_FIELDS = "protocol,domain,port,title,os,server,country,asn,org,asset_type,fid,icp"
+FREE_FIELDS = ["ip", "port", "protocol", "country", "country_name", "region", "city", "longitude", "latitude", "asn", "org", "host", "domain", "os", "server", "icp", "title", "jarm", "header", "banner", "cert", "base_protocol", "link", "cert.issuer.org", "cert.issuer.cn", "cert.subject.org", "cert.subject.cn", "tls.ja3s", "tls.version", "cert.sn", "cert.not_before", "cert.not_after", "cert.domain"]
+PERSONAL_FIELDS = FREE_FIELDS + ["header_hash", "banner_hash", "banner_fid"]
+BUSINESS_FIELDS = PERSONAL_FIELDS + ["cname", "lastupdatetime", "product", "product_category", "version", "icon_hash", "cert.is_valid", "cname_domain", "body", "cert.is_match", "cert.is_equal"]
+ENTERPRISE_FIELDS = BUSINESS_FIELDS + ["icon", "fid", "structinfo"]
+FIELD_CATEGORIES = {
+    "免费字段": FREE_FIELDS,
+    "个人会员字段": list(set(PERSONAL_FIELDS) - set(FREE_FIELDS)),
+    "商业版本字段": list(set(BUSINESS_FIELDS) - set(PERSONAL_FIELDS)),
+    "企业版本字段": list(set(ENTERPRISE_FIELDS) - set(BUSINESS_FIELDS)),
+}
+KEY_LEVELS = {}
+
+# --- 日志配置 ---
+if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > (5 * 1024 * 1024):
+    try: os.rename(LOG_FILE, LOG_FILE + '.old')
+    except OSError as e: print(f"无法轮换日志文件: {e}")
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
 )
+logging.getLogger("requests").setLevel(logging.WARNING); logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- 辅助函数 ---
-def load_json_file(filename, default_data):
-    """加载JSON文件，如果文件不存在或为空则创建并使用默认数据"""
-    if os.path.exists(filename) and os.path.getsize(filename) > 0:
-        with open(filename, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return default_data
-    else:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(default_data, f, indent=4)
-        return default_data
+# --- 会话状态定义 (v10.9.6 重构) ---
+# 为每个独立的 ConversationHandler 分配唯一的状态范围，防止冲突
 
-def save_json_file(filename, data):
-    """保存数据到JSON文件"""
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4)
+# 主菜单交互 (ReplyKeyboardMarkup)
+STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
 
-def escape_markdown_v2(text: str) -> str:
-    """转义MarkdownV2特殊字符"""
-    if not isinstance(text, str):
-        text = str(text)
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+# /kkfofa 和 /allfofa 查询流程
+(
+    QUERY_STATE_GET_GUEST_KEY,
+    QUERY_STATE_ASK_CONTINENT,
+    QUERY_STATE_CONTINENT_CHOICE,
+    QUERY_STATE_CACHE_CHOICE,
+    QUERY_STATE_KKFOFA_MODE,
+    QUERY_STATE_GET_TRACEBACK_LIMIT,
+    QUERY_STATE_ALLFOFA_GET_LIMIT,
+) = range(10, 17)
 
-async def send_file_safely(update: Update, context: CallbackContext, filepath: str):
-    """
-    安全地发送文件，处理大小限制。
-    策略：
-    1. 尝试直接发送。
-    2. 如果失败 (过大)，尝试压缩后发送。
-    3. 如果压缩后仍过大，进行分卷压缩发送。
-    """
-    if not os.path.exists(filepath):
-        await update.message.reply_text("⛔️ 目标文件不存在。")
-        return
+# /settings 设置流程
+(
+    SETTINGS_STATE_MAIN, SETTINGS_STATE_ACTION,
+    SETTINGS_STATE_GET_KEY, SETTINGS_STATE_REMOVE_API,
+    SETTINGS_STATE_PRESET_MENU, SETTINGS_STATE_GET_PRESET_NAME,
+    SETTINGS_STATE_GET_PRESET_QUERY, SETTINGS_STATE_REMOVE_PRESET,
+    SETTINGS_STATE_GET_UPDATE_URL, SETTINGS_STATE_PROXYPOOL_MENU,
+    SETTINGS_STATE_GET_PROXY_ADD, SETTINGS_STATE_GET_PROXY_REMOVE,
+    SETTINGS_STATE_UPLOAD_API_MENU, SETTINGS_STATE_GET_UPLOAD_URL,
+    SETTINGS_STATE_GET_UPLOAD_TOKEN, SETTINGS_STATE_ADMIN_MENU,
+    SETTINGS_STATE_GET_ADMIN_ID_TO_ADD, SETTINGS_STATE_GET_ADMIN_ID_TO_REMOVE,
+    # 新增监控设置
+    SETTINGS_STATE_MONITOR_MENU, SETTINGS_STATE_GET_MONITOR_QUERY_TO_ADD,
+    SETTINGS_STATE_GET_MONITOR_ID_TO_REMOVE, SETTINGS_STATE_GET_MONITOR_ID_TO_CONFIG,
+    SETTINGS_STATE_GET_MONITOR_THRESHOLD
+) = range(20, 43)
 
-    file_size = os.path.getsize(filepath)
-    max_size = 50 * 1024 * 1024  # Telegram API限制 (50 MB)
-    chat_id = update.effective_chat.id
-    base_filename = os.path.basename(filepath)
+# /batch 批量导出流程
+(
+    BATCH_STATE_SELECT_FIELDS,
+    BATCH_STATE_MODE_CHOICE,
+    BATCH_STATE_GET_LIMIT,
+) = range(50, 53)
 
+# /stats, /import, /batchfind, /restore, /batchcheckapi 等独立流程
+(
+    STATS_STATE_GET_QUERY,
+    IMPORT_STATE_GET_FILE,
+    BATCHFIND_STATE_GET_FILE, BATCHFIND_STATE_SELECT_FEATURES,
+    RESTORE_STATE_GET_FILE,
+    BATCHCHECKAPI_STATE_GET_FILE,
+) = range(80, 86)
+
+# /scan 扫描流程 (CallbackQueryHandler)
+(
+    SCAN_STATE_GET_CONCURRENCY,
+    SCAN_STATE_GET_TIMEOUT,
+) = range(100, 102)
+
+# /preview 预览功能
+PREVIEW_STATE_PAGINATE = 110
+
+
+# --- 配置管理 & 缓存 ---
+def load_json_file(filename, default_content):
+    if not os.path.exists(filename):
+        with open(filename, 'w', encoding='utf-8') as f: json.dump(default_content, f, indent=4); return default_content
     try:
-        # 策略1: 直接发送
-        if file_size <= max_size:
-            logger.info(f"文件大小 ({file_size} bytes) 在限制内，尝试直接发送 {filepath}")
-            await context.bot.send_document(chat_id, document=open(filepath, 'rb'), connect_timeout=60, read_timeout=60)
-            return
-        
-        # 策略2: 压缩后发送
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip_file:
-            zip_path = tmp_zip_file.name
-        
-        logger.info(f"文件过大，尝试压缩到 {zip_path}")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.write(filepath, arcname=base_filename)
-        
-        zip_size = os.path.getsize(zip_path)
-        if zip_size <= max_size:
-            logger.info(f"压缩后大小 ({zip_size} bytes) 在限制内，发送压缩文件。")
-            await context.bot.send_document(chat_id, document=open(zip_path, 'rb'), connect_timeout=60, read_timeout=60,
-                                            caption=f"文件 '{base_filename}' 因过大已被压缩。")
-            os.remove(zip_path)
-            return
-        
-        os.remove(zip_path) # 清理未分卷的压缩文件
-
-        # 策略3: 分卷压缩发送
-        logger.info(f"压缩后仍过大，开始分卷压缩。")
-        split_size = max_size - (1024 * 1024) # 留出1MB的余量
-        
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            zip_base_name = os.path.join(tmp_dir, base_filename)
-            part_num = 1
-            with zipfile.ZipFile(f"{zip_base_name}.zip.001", 'w', zipfile.ZIP_DEFLATED) as zf:
-                total_size = 0
-                
-                # 创建一个虚拟的大文件来进行分卷测试
-                # In a real scenario, you'd process the actual large file
-                zf.write(filepath, arcname=base_filename)
-            
-            # 这部分需要一个更复杂的逻辑来真实地分割一个大文件的压缩流
-            # `zipfile`库不直接支持分卷写入。需要手动管理流。
-            # 以下是一个简化的实现，直接分割压缩好的文件
-            with open(zip_path, 'rb') as f_in:
-                 part_num = 1
-                 while True:
-                    part_filename = f"{zip_path}.{str(part_num).zfill(3)}"
-                    with open(part_filename, 'wb') as f_out:
-                        chunk = f_in.read(split_size)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
-                    
-                    logger.info(f"发送分卷: {part_filename}")
-                    await context.bot.send_document(chat_id, document=open(part_filename, 'rb'),
-                                                    caption=f"'{base_filename}' 分卷 {part_num}",
-                                                    connect_timeout=60, read_timeout=60)
-                    os.remove(part_filename)
-                    part_num += 1
-
-            if os.path.exists(zip_path):
-                 os.remove(zip_path)
-
-            await update.message.reply_text(f"✅ 文件已分卷压缩并发送完毕。请下载所有分卷后解压。")
-
-
-    except Exception as e:
-        logger.error(f"发送文件 {filepath} 时出错: {e}", exc_info=True)
-        await update.message.reply_text(f"⛔️ 发送文件时遇到错误: {e}")
-
-
-# --- 加载配置 ---
+        with open(filename, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            if isinstance(default_content, dict):
+                for key, value in default_content.items(): config.setdefault(key, value)
+            return config
+    except (json.JSONDecodeError, IOError):
+        logger.error(f"{filename} 损坏，将使用默认配置重建。");
+        with open(filename, 'w', encoding='utf-8') as f: json.dump(default_content, f, indent=4); return default_content
+def save_json_file(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_ascii=False)
+DEFAULT_CONFIG = { 
+    "bot_token": "YOUR_BOT_TOKEN_HERE", "apis": [], "admins": [], "proxy": "", 
+    "proxies": [], "full_mode": False, "public_mode": False, "presets": [], 
+    "update_url": "", "upload_api_url": "", "upload_api_token": "",
+    "show_download_links": True
+}
 CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
-HISTORY = load_json_file(HISTORY_FILE, {})
+HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
+ANONYMOUS_KEYS = load_json_file(ANONYMOUS_KEYS_FILE, {})
+SCAN_TASKS = load_json_file(SCAN_TASKS_FILE, {})
+MONITOR_TASKS = load_json_file(MONITOR_TASKS_FILE, {}) # 加载监控任务
+def save_config(): save_json_file(CONFIG_FILE, CONFIG)
+def save_anonymous_keys(): save_json_file(ANONYMOUS_KEYS_FILE, ANONYMOUS_KEYS)
+def save_scan_tasks():
+    logger.info(f"Saving {len(SCAN_TASKS)} scan tasks to {SCAN_TASKS_FILE}")
+    save_json_file(SCAN_TASKS_FILE, SCAN_TASKS)
+def save_monitor_tasks():
+    save_json_file(MONITOR_TASKS_FILE, MONITOR_TASKS)
+def add_or_update_query(query_text, cache_data=None):
+    existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
+    if existing_query:
+        HISTORY['queries'].remove(existing_query); existing_query['timestamp'] = datetime.now(tz.tzutc()).isoformat()
+        if cache_data: existing_query['cache'] = cache_data
+        HISTORY['queries'].insert(0, existing_query)
+    else:
+        new_query = {"query_text": query_text, "timestamp": datetime.now(tz.tzutc()).isoformat(), "cache": cache_data}
+        HISTORY['queries'].insert(0, new_query)
+    while len(HISTORY['queries']) > MAX_HISTORY_SIZE: HISTORY['queries'].pop()
+    save_json_file(HISTORY_FILE, HISTORY)
+def find_cached_query(query_text):
+    query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
+    if query and query.get('cache'):
+        if 'file_path' in query['cache'] and os.path.exists(query['cache']['file_path']):
+            return query
+    return None
 
-# --- 权限和装饰器 ---
+# --- 辅助函数与装饰器 ---
+def generate_filename_from_query(query_text: str, prefix: str = "fofa", ext: str = ".txt") -> str:
+    sanitized_query = re.sub(r'[^a-z0-9\-_]+', '_', query_text.lower()).strip('_')
+    max_len = 100
+    if len(sanitized_query) > max_len: sanitized_query = sanitized_query[:max_len].rsplit('_', 1)[0]
+    timestamp = int(time.time()); return f"{prefix}_{sanitized_query}_{timestamp}{ext}"
+def get_proxies(proxy_to_use=None):
+    """
+    返回一个代理配置字典。
+    如果提供了 proxy_to_use，则专门使用它。
+    否则，从代理池中随机选择一个。
+    """
+    proxy_str = proxy_to_use
+    if proxy_str is None:
+        proxies_list = CONFIG.get("proxies", [])
+        if proxies_list:
+            proxy_str = random.choice(proxies_list)
+        else:
+            proxy_str = CONFIG.get("proxy")
+    
+    if proxy_str:
+        return {"http": proxy_str, "https": proxy_str}
+    return None
+def is_admin(user_id: int) -> bool: return user_id in CONFIG.get('admins', [])
 def is_super_admin(user_id: int) -> bool:
-    """检查用户是否为超级管理员（管理员列表中的第一个）"""
-    return user_id in CONFIG['admins'] and CONFIG['admins'].index(user_id) == 0
-
-def is_admin(user_id: int) -> bool:
-    """检查用户是否为管理员"""
-    return user_id in CONFIG['admins']
+    admins = CONFIG.get('admins', [])
+    return admins and user_id == admins[0]
 
 def admin_only(func):
-    """装饰器：限制只有管理员才能访问"""
     @wraps(func)
     def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
         if not is_admin(update.effective_user.id):
-            message_text = "⛔️ 抱歉，您不是授权管理员。"
-            if update.callback_query:
-                update.callback_query.answer(message_text, show_alert=True)
-            elif update.message:
-                update.message.reply_text(message_text)
+            message_text = "⛔️ 抱歉，您没有权限执行此管理操作。"
+            if update.callback_query: update.callback_query.answer(message_text, show_alert=True)
+            elif update.message: update.message.reply_text(message_text)
             return None
         return func(update, context, *args, **kwargs)
     return wrapped
 
 def super_admin_only(func):
-    """装饰器：限制只有超级管理员才能访问"""
     @wraps(func)
     def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
         if not is_super_admin(update.effective_user.id):
             message_text = "⛔️ 抱歉，此为超级管理员专属功能。"
-            if update.callback_query:
-                update.callback_query.answer(message_text, show_alert=True)
-            elif update.message:
-                update.message.reply_text(message_text)
+            if update.callback_query: update.callback_query.answer(message_text, show_alert=True)
+            elif update.message: update.message.reply_text(message_text)
             return None
         return func(update, context, *args, **kwargs)
     return wrapped
+def escape_markdown_v2(text: str) -> str:
+    if not isinstance(text, str): text = str(text)
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+def create_progress_bar(percentage: float, length: int = 10) -> str:
+    if percentage < 0: percentage = 0
+    if percentage > 100: percentage = 100
+    filled_length = int(length * percentage // 100)
+    bar = '█' * filled_length + '░' * (length - filled_length)
+    return f"[{bar}] {percentage:.1f}%"
 
-# --- 命令处理函数 ---
-
-@admin_only
-async def start_command(update: Update, context: CallbackContext):
-    """处理 /start 命令"""
-    user = update.effective_user
-    await update.message.reply_html(
-        f"👋 你好, {user.mention_html()}!\n\n这是一个FOFA查询机器人。使用 /help 查看可用命令。",
-    )
-    
-@admin_only
-async def help_command(update: Update, context: CallbackContext):
-    """处理 /help 命令"""
-    # ... 省略了 help 内容的定义 ...
-    is_super = is_super_admin(update.effective_user.id)
-    
-    base_commands = """
-*查询功能*
-/fofa <query> \- 执行FOFA查询
-/preview <file> \- 快速预览文件内容
-/history \- 查看查询历史
-/file <query> \- 在查询历史中搜索并获取文件
-    """
-    
-    super_admin_commands = """
-*⚙️ 超级管理员设置*
-/settings \- 打开设置菜单
-/addadmin <user\_id> \- 添加管理员
-/deladmin <user\_id> \- 删除管理员
-/addapi <name> <email> <key> \- 添加FOFA API
-/delapi <name> \- 删除FOFA API
-/setproxy <url> \- 设置代理
-/delproxy <url> \- 删除代理
-/addpreset <name> <query> \- 添加预设查询
-/delpreset <name> \- 删除预设查询
-/setuploadapi <url> <token> \- 设置上传API
-/backup \- 备份所有JSON配置文件
-/selfupdate \- 自我更新
-    """
-
-    help_text = escape_markdown_v2("可用命令:\n") + base_commands
-    if is_super:
-        help_text += super_admin_commands
-
-    await update.message.reply_text(help_text, parse_mode='MarkdownV2')
-
-
-# --- 设置菜单 (超级管理员专属) ---
-SETTINGS_MENU, ADMIN_SETTINGS_MENU = range(2)
-
-@super_admin_only
-async def settings_command(update: Update, context: CallbackContext):
-    """显示设置菜单"""
-    keyboard = [
-        [InlineKeyboardButton(f"综合查询模式: {'✅' if CONFIG.get('full_mode') else '❌'}", callback_data='toggle_full_mode')],
-        [InlineKeyboardButton(f"公开模式: {'✅' if CONFIG.get('public_mode') else '❌'}", callback_data='toggle_public_mode')],
-        [InlineKeyboardButton(f"显示下载链接: {'✅' if CONFIG.get('show_download_links', True) else '❌'}", callback_data='toggle_show_download_links')],
-        [InlineKeyboardButton("关闭菜单", callback_data='close_settings')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('⚙️ *机器人设置*', reply_markup=reply_markup, parse_mode='Markdown')
-    return SETTINGS_MENU
-
-@admin_only
-async def settings_menu_handler(update: Update, context: CallbackContext):
-    """处理普通管理员和超级管理员的菜单访问"""
-    if is_super_admin(update.effective_user.id):
-        # 完整的设置菜单
-        return await settings_command(update, context)
-    else:
-        # 受限的菜单（或无菜单）
-        await update.message.reply_text(" केवल सुपर एडमिन ही सेटिंग्स बदल सकते हैं।")
-        return ConversationHandler.END
-
-async def toggle_setting_handler(update: Update, context: CallbackContext):
-    """处理切换配置选项"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    if not is_super_admin(user_id):
-        await query.answer("⛔️ 权限不足！", show_alert=True)
-        return SETTINGS_MENU
-        
-    toggle_map = {
-        'toggle_full_mode': 'full_mode',
-        'toggle_public_mode': 'public_mode',
-        'toggle_show_download_links': 'show_download_links'
-    }
-    
-    setting_key = toggle_map.get(query.data)
-    if not setting_key:
-        await query.answer("内部错误", show_alert=True)
-        return SETTINGS_MENU
-
-    CONFIG[setting_key] = not CONFIG.get(setting_key, False if setting_key != 'show_download_links' else True)
-    save_json_file(CONFIG_FILE, CONFIG)
-
-    # 重新生成键盘以反映新状态
-    keyboard = [
-        [InlineKeyboardButton(f"综合查询模式: {'✅' if CONFIG.get('full_mode') else '❌'}", callback_data='toggle_full_mode')],
-        [InlineKeyboardButton(f"公开模式: {'✅' if CONFIG.get('public_mode') else '❌'}", callback_data='toggle_public_mode')],
-        [InlineKeyboardButton(f"显示下载链接: {'✅' if CONFIG.get('show_download_links', True) else '❌'}", callback_data='toggle_show_download_links')],
-        [InlineKeyboardButton("关闭菜单", callback_data='close_settings')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text='⚙️ *机器人设置*', reply_markup=reply_markup, parse_mode='Markdown')
-    return SETTINGS_MENU
-
-async def close_settings_handler(update: Update, context: CallbackContext):
-    """关闭设置菜单"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(text="设置菜单已关闭。")
-    return ConversationHandler.END
-    
-async def invalid_settings_option(update: Update, context: CallbackContext):
-    """处理无效的设置选项"""
-    await update.message.reply_text("无效选项，请重试。")
-    return SETTINGS_MENU
-
-# --- 配置文件管理 (备份/恢复) ---
-@super_admin_only
-async def backup_config_command(update: Update, context: CallbackContext):
-    """备份所有.json文件到一个zip压缩包中"""
-    chat_id = update.effective_chat.id
+# --- 文件上传辅助函数 ---
+def send_file_safely(context: CallbackContext, chat_id: int, file_path: str, caption: str = "", parse_mode: str = None, filename: str = None):
+    """安全地发送文件，处理Telegram API的大小限制，支持自动压缩和分卷。"""
+    temp_files_to_clean = []
     try:
-        json_files = glob.glob('*.json')
-        if not json_files:
-            await update.message.reply_text("未找到任何 .json 文件进行备份。")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"文件未找到 at path {file_path}")
+
+        file_size = os.path.getsize(file_path)
+        base_filename = filename or os.path.basename(file_path)
+
+        # 1. 直接发送
+        if file_size < TELEGRAM_MAX_FILE_SIZE_BYTES:
+            with open(file_path, 'rb') as doc:
+                context.bot.send_document(
+                    chat_id, document=doc, filename=base_filename,
+                    caption=caption, parse_mode=parse_mode, timeout=120)
             return
 
-        # 创建一个临时文件来存储zip
-        with tempfile.NamedTemporaryFile(prefix='backup_', suffix='.zip', delete=False) as tmp_zip_file:
-            zip_filename = tmp_zip_file.name
-
-        with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for file in json_files:
-                zf.write(file)
-        
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=open(zip_filename, 'rb'),
-            filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-            caption=f"✅ 成功备份 {len(json_files)} 个配置文件。"
-        )
-        os.remove(zip_filename) # 发送后删除临时文件
-
-    except Exception as e:
-        logger.error(f"备份失败: {e}", exc_info=True)
-        await update.message.reply_text(f"⛔️ 备份过程中发生错误: {e}")
-
-RECEIVING_CONFIG = range(1)
-async def receive_config_file_entry(update: Update, context: CallbackContext):
-    if not is_super_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ 抱歉，此为超级管理员专属功能。")
-        return ConversationHandler.END
-    await update.message.reply_text("请直接发送您的 `config.json` 或包含所有配置的 `.zip` 备份文件给我。")
-    return RECEIVING_CONFIG
-
-async def receive_config_file(update: Update, context: CallbackContext):
-    """接收并处理用户上传的配置文件"""
-    # 修复了 global 声明的语法
-    global CONFIG
-    global HISTORY
-    
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("请发送文件。")
-        return RECEIVING_CONFIG
-
-    file_extension = os.path.splitext(document.file_name)[1].lower()
-    
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            file_path = os.path.join(tmp_dir, document.file_name)
-            bot_file = await context.bot.get_file(document.file_id)
-            await bot_file.download_to_drive(custom_path=file_path)
-
-            if file_extension == '.json':
-                # 处理单个JSON文件
-                os.replace(file_path, CONFIG_FILE)
-                CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
-                await update.message.reply_text("✅ `config.json` 已成功更新。机器人将自动重启以应用新配置。")
-
-            elif file_extension == '.zip':
-                # 处理ZIP备份文件
-                with zipfile.ZipFile(file_path, 'r') as zf:
-                    json_files_in_zip = [f for f in zf.namelist() if f.endswith('.json')]
-                    if not json_files_in_zip:
-                        await update.message.reply_text("⛔️ Zip文件中未找到任何 .json 配置文件。")
-                        return RECEIVING_CONFIG
-                    
-                    zf.extractall('.') # 解压到当前目录
-                
-                # 重新加载配置
-                CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
-                HISTORY = load_json_file(HISTORY_FILE, {})
-
-                await update.message.reply_text(
-                    f"✅ 已从zip文件中成功恢复 {len(json_files_in_zip)} 个文件。机器人将自动重启。"
-                )
-            else:
-                await update.message.reply_text("⛔️ 不支持的文件类型。请发送 `.json` 或 `.zip` 文件。")
-                return RECEIVING_CONFIG
-
-        # 触发重启
-        asyncio.create_task(context.application.shutdown())
-        return ConversationHandler.END
-
-    except Exception as e:
-        logger.error(f"恢复配置失败: {e}", exc_info=True)
-        await update.message.reply_text(f"⛔️ 处理文件时出错: {e}")
-        return ConversationHandler.END
-
-async def cancel_receive_config(update: Update, context: CallbackContext):
-    """取消接收文件"""
-    await update.message.reply_text("已取消操作。")
-    return ConversationHandler.END
-    
-# 其他被省略的命令（addadmin, deladmin, 等）将在这里
-# 为了简洁，我们仅实现核心逻辑
-# ...
-@super_admin_only
-async def add_admin_command(update: Update, context: CallbackContext):
-    try:
-        user_id = int(context.args[0])
-        if user_id not in CONFIG['admins']:
-            CONFIG['admins'].append(user_id)
-            save_json_file(CONFIG_FILE, CONFIG)
-            await update.message.reply_text(f"✅ 管理员 {user_id} 添加成功。")
-        else:
-            await update.message.reply_text(f"ℹ️ 用户 {user_id} 已经是管理员。")
-    except (IndexError, ValueError):
-        await update.message.reply_text("用法: /addadmin <user_id>")
-
-@super_admin_only
-async def del_admin_command(update: Update, context: CallbackContext):
-    try:
-        user_id = int(context.args[0])
-        if user_id in CONFIG['admins']:
-            # 超级管理员不能被删除
-            if CONFIG['admins'].index(user_id) == 0:
-                await update.message.reply_text("⛔️ 不能删除超级管理员。")
+        # 2. 尝试单文件压缩
+        context.bot.send_message(chat_id, f"⚠️ 文件 `{escape_markdown_v2(base_filename)}` 过大，正在尝试压缩\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        zip_path = file_path + ".zip"
+        temp_files_to_clean.append(zip_path)
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.write(file_path, arcname=base_filename)
+            
+            if os.path.getsize(zip_path) < TELEGRAM_MAX_FILE_SIZE_BYTES:
+                with open(zip_path, 'rb') as doc:
+                    context.bot.send_document(
+                        chat_id, document=doc, filename=os.path.basename(zip_path),
+                        caption=f"{caption}\n\n*文件已被压缩*", parse_mode=parse_mode, timeout=180)
                 return
-            CONFIG['admins'].remove(user_id)
-            save_json_file(CONFIG_FILE, CONFIG)
-            await update.message.reply_text(f"✅ 管理员 {user_id} 删除成功。")
-        else:
-            await update.message.reply_text(f"ℹ️ 用户 {user_id} 不是管理员。")
-    except (IndexError, ValueError):
-        await update.message.reply_text("用法: /deladmin <user_id>")
+        except Exception as e:
+            logger.error(f"压缩文件 '{file_path}' 时出错: {e}")
+            # Fall through to next method
 
+        # 3. 如果是可分割文件类型(txt, csv), 进行分卷
+        if base_filename.endswith(('.txt', '.csv')):
+            context.bot.send_message(chat_id, "⚠️ 压缩后文件依然过大，将进行分卷发送。")
+            part_num = 1
+            part_size = 45 * 1024 * 1024  # 45MB parts
+            
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                while True:
+                    lines = f.readlines(part_size)
+                    if not lines:
+                        break
+                    
+                    part_filename = f"{base_filename}.part{part_num}"
+                    part_path = os.path.join(os.path.dirname(file_path), part_filename)
+                    temp_files_to_clean.append(part_path)
+                    
+                    with open(part_path, 'w', encoding='utf-8') as pf:
+                        pf.writelines(lines)
+                    
+                    with open(part_path, 'rb') as doc:
+                        context.bot.send_document(chat_id, document=doc, filename=part_filename, timeout=180)
+                    part_num += 1
+            
+            # 使用转义确保文件名中的特殊字符不会破坏格式
+            safe_base_filename = escape_markdown_v2(base_filename)
+            context.bot.send_message(chat_id, f"✅ 分卷发送完成。\n您可以通过 `copy /b {safe_base_filename}\\.part\\* {safe_base_filename}` (Win) 或 `cat {safe_base_filename}\\.part\\* > {safe_base_filename}` (Linux/Mac) 来合并文件。", parse_mode=ParseMode.MARKDOWN_V2)
+
+            return
+
+        # 4. 如果以上都不行，发送错误
+        size_str = escape_markdown_v2(f"{file_size / (1024 * 1024):.2f}")
+        TELEGRAM_MAX_FILE_SIZE_MB = int(TELEGRAM_MAX_FILE_SIZE_BYTES / (1024*1024))
+        message = (
+            f"⚠️ *文件过大*\n\n"
+            f"文件 `{escape_markdown_v2(base_filename)}` \\({size_str} MB\\) "
+            f"即使在压缩后也超过了Telegram的发送限制 \\({TELEGRAM_MAX_FILE_SIZE_MB} MB\\)，且不支持分卷，无法发送。"
+        )
+        context.bot.send_message(chat_id, message, parse_mode=ParseMode.MARKDOWN_V2)
+
+    except FileNotFoundError:
+        logger.error(f"尝试发送文件失败: 文件未找到 at path {file_path}")
+        context.bot.send_message(chat_id, f"❌ 内部错误: 尝试发送结果文件时找不到它。")
+    except (TimedOut, NetworkError) as e:
+        logger.error(f"发送文件 '{file_path}' 时出现网络错误或超时: {e}")
+        context.bot.send_message(chat_id, f"⚠️ 发送文件时网络超时或出错。")
+    except Exception as e:
+        logger.error(f"发送文件 '{file_path}' 时出现未知错误: {e}", exc_info=True)
+        context.bot.send_message(chat_id, f"⚠️ 发送文件时出现未知错误: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+    finally:
+        for tf in temp_files_to_clean:
+            if os.path.exists(tf):
+                os.remove(tf)
+
+def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str):
+    if not CONFIG.get("show_download_links", True):
+        return
+        
+    api_url = CONFIG.get("upload_api_url")
+    api_token = CONFIG.get("upload_api_token")
+    if not api_url or not api_token:
+        logger.info("未配置上传API的URL或Token，跳过文件上传。")
+        return
+    try:
+        with open(file_path, 'rb') as f:
+            files = {'file': (os.path.basename(file_path), f)}
+            headers = {'Authorization': api_token}
+            response = requests.post(api_url, headers=headers, files=files, timeout=60, proxies=get_proxies())
+            response.raise_for_status()
+            result = response.json()
+        if result and isinstance(result, list) and 'src' in result[0]:
+            file_url_path = result[0]['src']
+            parsed_main_url = urlparse(api_url)
+            base_url = f"{parsed_main_url.scheme}://{parsed_main_url.netloc}"
+            full_url = base_url + file_url_path
+            file_name = os.path.basename(file_url_path)
+            download_commands = (
+                f"📥 *文件下载命令*\n\n"
+                f"*cURL:*\n`curl -o \"{escape_markdown_v2(file_name)}\" \"{escape_markdown_v2(full_url)}\"`\n\n"
+                f"*Wget:*\n`wget --content-disposition \"{escape_markdown_v2(full_url)}\"`"
+            )
+            context.bot.send_message(chat_id, download_commands, parse_mode=ParseMode.MARKDOWN_V2)
+        else:
+            raise ValueError(f"响应格式不正确: {result}")
+    except Exception as e:
+        logger.error(f"文件上传失败: {e}")
+        context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+# --- FOFA API 核心逻辑 ---
+def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_session=None):
+    if use_b64 and 'q' in params:
+        params['qbase64'] = base64.b64encode(params.pop('q').encode('utf-8')).decode('utf-8')
+    
+    last_error = None
+    # v10.9.4 FIX: 为整个重试循环确定代理。
+    # 如果传递了特定的会话，则使用它。否则，为此尝试获取一个随机的。
+    request_proxies = get_proxies(proxy_to_use=proxy_session)
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, params=params, timeout=timeout, proxies=request_proxies, verify=False)
+            if response.status_code == 429:
+                wait_time = 5 * (attempt + 1)
+                logger.warning(f"FOFA API rate limit hit (429). Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
+                time.sleep(wait_time)
+                last_error = f"API请求因速率限制(429)失败"
+                continue
+            if response.status_code == 502: # Bad Gateway
+                wait_time = 5 * (attempt + 1)
+                logger.warning(f"FOFA API returned 502 Bad Gateway. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
+                time.sleep(wait_time)
+                last_error = "API请求失败 (502 Bad Gateway)"
+                continue
+            response.raise_for_status()
+            data = response.json()
+            if data.get("error"):
+                return None, data.get("errmsg", "未知的FOFA错误")
+            return data, None
+        except requests.exceptions.RequestException as e:
+            last_error = f"网络请求失败: {e}"
+            wait_time = 5 * (attempt + 1) # 指数退避
+            logger.error(f"RequestException on attempt {attempt + 1}, retrying in {wait_time}s: {e}")
+            time.sleep(wait_time)
+        except json.JSONDecodeError as e:
+            last_error = f"解析JSON响应失败: {e}"
+            break
+    logger.error(f"API request failed after {retries} retries. Last error: {last_error}")
+    return None, last_error if last_error else "API请求未知错误"
+def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
+def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None):
+    query_lower = query.lower()
+    if 'body=' in query_lower: page_size = min(page_size, 500)
+    elif 'cert=' in query_lower: page_size = min(page_size, 2000)
+    params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
+    return _make_api_request(FOFA_SEARCH_URL, params, proxy_session=proxy_session)
 def fetch_fofa_stats(key, query, proxy_session=None):
     params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}
     return _make_api_request(FOFA_STATS_URL, params, proxy_session=proxy_session)
-
 def fetch_fofa_host_info(key, host, detail=False, proxy_session=None):
     url = FOFA_HOST_BASE_URL + host
     params = {'key': key, 'detail': str(detail).lower()}
@@ -615,15 +597,9 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
         if not error:
             # 返回成功使用的代理。
             return data, key, key_num, key_level, current_proxy_session_str, None
-        
-        error_str = str(error)
-        if "[820031]" in error_str:
-            logger.warning(f"Key [#{key_num}] F点余额不足...");
+        if "[820031]" in str(error) or "[45022]" in str(error):
+            logger.warning(f"Key [#{key_num}] 额度用尽或请求受限 (Code: 820031/45022), 尝试下一个...");
             continue
-        if "[45022]" in error_str:
-            logger.warning(f"Key [#{key_num}] 今日请求次数已达上限...");
-            continue
-
         # 对于其他错误，快速失败并返回问题key的信息
         return None, key, key_num, key_level, current_proxy_session_str, error
         
@@ -777,7 +753,7 @@ def run_async_scan_job(context: CallbackContext):
     output_filename = generate_filename_from_query(original_query, prefix=f"{mode}_scan")
     with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(live_results))))
     
-    final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\!*\n\n共发现 *{len(live_results)}* 个存活目标\\."
+    final_caption = f"✅ *异步{escape_markdown_v2(scan_type_text)}完成\\!*\n\n共发现 *{len(live_results)}* 个存活目标\\."
     send_file_safely(context, chat_id, output_filename, caption=final_caption, parse_mode=ParseMode.MARKDOWN_V2)
     upload_and_send_links(context, chat_id, output_filename)
     os.remove(output_filename)
@@ -1057,7 +1033,9 @@ def run_traceback_download_query(context: CallbackContext):
         upload_and_send_links(context, chat_id, cache_path)
         cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
         add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query)
-    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
+    else: 
+        try: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
+        except (BadRequest, RetryAfter, TimedOut): pass
     context.bot_data.pop(stop_flag, None)
 def run_incremental_update_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; msg = bot.send_message(chat_id, "--- 增量更新启动 ---")
@@ -1203,7 +1181,8 @@ def run_batch_traceback_query(context: CallbackContext):
             except (ValueError, TypeError): continue
         if not valid_anchor_found: termination_reason = "\n\n⚠️ 无法找到有效的时间锚点以继续，可能已达查询边界."; break
     if unique_results:
-        msg.edit_text(f"✅ 追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在生成CSV...")
+        try: msg.edit_text(f"✅ 追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在生成CSV...")
+        except (BadRequest, RetryAfter, TimedOut): pass
         try:
             with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(unique_results)
@@ -1214,7 +1193,9 @@ def run_batch_traceback_query(context: CallbackContext):
         finally:
             if os.path.exists(output_filename): os.remove(output_filename)
             msg.delete()
-    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
+    else:
+        try: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
+        except (BadRequest, RetryAfter, TimedOut): pass
     context.bot_data.pop(stop_flag, None)
 
 # --- 监控系统 (Data Reservoir + Radar Mode) ---
@@ -2313,10 +2294,13 @@ def receive_api_file(update: Update, context: CallbackContext) -> int:
 # --- 其他管理命令 ---
 @admin_only
 def check_command(update: Update, context: CallbackContext):
+    global CONFIG
     msg = update.message.reply_text("⏳ 正在执行系统自检...")
     report = ["*📋 系统自检报告*"]
+    
     try:
-        global CONFIG; CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
+        
+        CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
         report.append("✅ *配置文件*: `config\\.json` 加载正常")
     except Exception as e:
         report.append(f"❌ *配置文件*: 加载失败 \\- {escape_markdown_v2(str(e))}")
@@ -3376,11 +3360,11 @@ def interactive_setup():
 
     save_config()
     print("✅ 配置已保存到 config.json。")
-    CONFIG = load_json_file(CONFIG_FILE, DEFAULT_CONFIG)
+    # CONFIG a été mis à jour en mémoire et enregistré sur le disque, pas besoin de le recharger ici.
+    # Le rechargement est géré par l'appelant si nécessaire.
     return True
 
 def main() -> None:
-    global CONFIG
     os.makedirs(FOFA_CACHE_DIR, exist_ok=True)
 
     if not os.path.exists(CONFIG_FILE) or CONFIG.get("bot_token") == "YOUR_BOT_TOKEN_HERE":
