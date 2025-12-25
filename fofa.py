@@ -5,7 +5,15 @@ import re
 from datetime import datetime
 from functools import wraps
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, ConversationHandler, CallbackQueryHandler
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    ConversationHandler,
+    CallbackQueryHandler
+)
 import traceback
 import asyncio
 import glob
