@@ -38,6 +38,10 @@ from telegram.ext import (
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, InvalidToken
 
 # --- 全局变量和常量 ---
+API_SESSION = requests.Session()
+API_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=3)
+API_SESSION.mount('http://', API_ADAPTER)
+API_SESSION.mount('https://', API_ADAPTER)
 CONFIG_FILE = 'config.json'
 HISTORY_FILE = 'history.json'
 LOG_FILE = 'fofa_bot.log'
@@ -401,7 +405,7 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_s
 
     for attempt in range(retries):
         try:
-            response = requests.get(url, params=params, timeout=timeout, proxies=request_proxies, verify=False)
+            response = API_SESSION.get(url, params=params, timeout=timeout, proxies=request_proxies, verify=False)
             if response.status_code == 429:
                 wait_time = 5 * (attempt + 1)
                 logger.warning(f"FOFA API rate limit hit (429). Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
@@ -431,9 +435,7 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_s
     return None, last_error if last_error else "API请求未知错误"
 def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
 def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None):
-    query_lower = query.lower()
-    if 'body=' in query_lower: page_size = min(page_size, 500)
-    elif 'cert=' in query_lower: page_size = min(page_size, 2000)
+    
     params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
     return _make_api_request(FOFA_SEARCH_URL, params, proxy_session=proxy_session)
 def fetch_fofa_stats(key, query, proxy_session=None):
@@ -597,8 +599,8 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
         if not error:
             # 返回成功使用的代理。
             return data, key, key_num, key_level, current_proxy_session_str, None
-        if "[820031]" in str(error) or "[45022]" in str(error):
-            logger.warning(f"Key [#{key_num}] 额度用尽或请求受限 (Code: 820031/45022), 尝试下一个...");
+        if "[820031]" in str(error):
+            logger.warning(f"Key [#{key_num}] F点余额不足...");
             continue
         # 对于其他错误，快速失败并返回问题key的信息
         return None, key, key_num, key_level, current_proxy_session_str, error
@@ -619,19 +621,37 @@ async def async_scanner_orchestrator(scan_targets, concurrency, timeout, progres
     semaphore = asyncio.Semaphore(concurrency)
     total_tasks = len(scan_targets)
     completed_tasks = 0
+    all_results = []
+    
+    # Best Practice: Batch processing to avoid FD exhaustion and memory overflow
+    BATCH_SIZE = 10000
     
     async def worker(host, port):
         nonlocal completed_tasks
         async with semaphore:
-            result = await async_check_port(host, port, timeout)
+            try:
+                result = await async_check_port(host, port, timeout)
+            except Exception:
+                result = None
+            
             completed_tasks += 1
             if progress_callback:
-                await progress_callback(completed_tasks, total_tasks)
+                try:
+                    await progress_callback(completed_tasks, total_tasks)
+                except Exception:
+                    pass
             return result
 
-    tasks = [worker(host, port) for host, port in scan_targets]
-    results = await asyncio.gather(*tasks)
-    return [res for res in results if res is not None]
+    # Execute tasks in batches
+    for i in range(0, total_tasks, BATCH_SIZE):
+        batch = scan_targets[i : i + BATCH_SIZE]
+        tasks = [worker(host, port) for host, port in batch]
+        batch_results = await asyncio.gather(*tasks)
+        for res in batch_results:
+            if res is not None:
+                all_results.append(res)
+                
+    return all_results
 
 def run_async_scan_job(context: CallbackContext):
     job_context = context.job.context
@@ -790,17 +810,17 @@ def start_scan_callback(update: Update, context: CallbackContext) -> int:
 
     context.user_data['scan_original_query'] = original_query
     context.user_data['scan_mode'] = mode
-    query.message.edit_text("请输入扫描并发数 (建议 100-1000):")
+    query.message.edit_text("请输入扫描并发数 (建议 100-5000):")
     return SCAN_STATE_GET_CONCURRENCY
 def get_concurrency_callback(update: Update, context: CallbackContext) -> int:
     try:
         concurrency = int(update.message.text)
-        if not 1 <= concurrency <= 5000: raise ValueError
+        if not 1 <= concurrency <= 50000: raise ValueError
         context.user_data['scan_concurrency'] = concurrency
         update.message.reply_text("请输入连接超时时间 (秒, 建议 1-3):")
         return SCAN_STATE_GET_TIMEOUT
     except ValueError:
-        update.message.reply_text("无效输入，请输入 1-5000 之间的整数。")
+        update.message.reply_text("无效输入，请输入 1-50000 之间的整数。")
         return SCAN_STATE_GET_CONCURRENCY
 def get_timeout_callback(update: Update, context: CallbackContext) -> int:
     try:
@@ -869,7 +889,7 @@ def run_sharded_download_job(context: CallbackContext):
     unique_results = set()
     stop_flag = f'stop_job_{chat_id}'
     
-    msg = bot.send_message(chat_id, f"⏳ *启动智能分片下载*\n目标：将查询按 {len(ALL_COUNTRY_CODES)} 个国家区域拆分...\n注意：此模式将消耗较多的 API 请求次数。", parse_mode=ParseMode.MARKDOWN_V2)
+    msg = bot.send_message(chat_id, f"⏳ *启动智能分片下载*\n目标：将查询按 {len(ALL_COUNTRY_CODES)} 个国家区域拆分\\.\\.\\.\n注意：此模式将消耗较多的 API 请求次数。", parse_mode=ParseMode.MARKDOWN_V2)
     
     start_time = time.time()
     last_ui_update_time = 0
@@ -1024,18 +1044,14 @@ def run_traceback_download_query(context: CallbackContext):
         if not valid_anchor_found: termination_reason = "\n\n⚠️ 无法找到有效的时间锚点以继续，可能已达查询边界."; break
     if unique_results:
         with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(unique_results))))
-        try:
-            msg.edit_text(f"✅ 深度追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...")
-        except (BadRequest, RetryAfter, TimedOut): pass
+        msg.edit_text(f"✅ 深度追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...")
         cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
         shutil.move(output_filename, cache_path)
         send_file_safely(context, chat_id, cache_path, filename=output_filename)
         upload_and_send_links(context, chat_id, cache_path)
         cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
         add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query)
-    else: 
-        try: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
-        except (BadRequest, RetryAfter, TimedOut): pass
+    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
     context.bot_data.pop(stop_flag, None)
 def run_incremental_update_query(context: CallbackContext):
     job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; msg = bot.send_message(chat_id, "--- 增量更新启动 ---")
@@ -1181,8 +1197,7 @@ def run_batch_traceback_query(context: CallbackContext):
             except (ValueError, TypeError): continue
         if not valid_anchor_found: termination_reason = "\n\n⚠️ 无法找到有效的时间锚点以继续，可能已达查询边界."; break
     if unique_results:
-        try: msg.edit_text(f"✅ 追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在生成CSV...")
-        except (BadRequest, RetryAfter, TimedOut): pass
+        msg.edit_text(f"✅ 追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在生成CSV...")
         try:
             with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(unique_results)
@@ -1193,9 +1208,7 @@ def run_batch_traceback_query(context: CallbackContext):
         finally:
             if os.path.exists(output_filename): os.remove(output_filename)
             msg.delete()
-    else:
-        try: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
-        except (BadRequest, RetryAfter, TimedOut): pass
+    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
     context.bot_data.pop(stop_flag, None)
 
 # --- 监控系统 (Data Reservoir + Radar Mode) ---
