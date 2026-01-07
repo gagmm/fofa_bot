@@ -1212,6 +1212,7 @@ def run_batch_traceback_query(context: CallbackContext):
     context.bot_data.pop(stop_flag, None)
 
 # --- 监控系统 (Data Reservoir + Radar Mode) ---
+@admin_only
 def monitor_command(update: Update, context: CallbackContext):
     args = context.args
     if not args:
@@ -3524,3 +3525,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
