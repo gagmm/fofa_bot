@@ -565,6 +565,7 @@ def get_fields_by_level(level):
 def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_session=None, min_level=0):
     if not CONFIG['apis']: return None, None, None, None, None, "没有配置任何API Key。"
     
+    # 筛选符合最低等级要求的 Key
     keys_to_try = [k for k in CONFIG['apis'] if KEY_LEVELS.get(k, -1) >= min_level]
     
     if not keys_to_try:
@@ -572,13 +573,17 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
             return None, None, None, None, None, f"没有找到等级不低于“个人会员”的有效API Key以执行此操作。"
         return None, None, None, None, None, "所有配置的API Key都无效。"
     
-    start_index = 0
+    # --- 负载均衡逻辑 (Load Balancing) ---
+    # 默认随机选择一个起始点，实现请求分摊
+    start_index = random.randint(0, len(keys_to_try) - 1)
+    
+    # 如果用户指定了特定 Key，则从该 Key 开始 (作为首选)
     if preferred_key_index is not None and 1 <= preferred_key_index <= len(CONFIG['apis']):
         preferred_key = CONFIG['apis'][preferred_key_index - 1]
         if preferred_key in keys_to_try:
             start_index = keys_to_try.index(preferred_key)
 
-    # v10.9.4 FIX: 如果未锁定代理会话，则在此回退序列的持续时间内选择一个。
+    # 确定代理会话
     current_proxy_session_str = proxy_session
     if current_proxy_session_str is None:
         proxies_list = CONFIG.get("proxies", [])
@@ -587,26 +592,32 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
         else:
             current_proxy_session_str = CONFIG.get("proxy")
 
+    # --- 轮询执行 (Round Robin with Failover) ---
     for i in range(len(keys_to_try)):
+        # 环形取 Key
         idx = (start_index + i) % len(keys_to_try)
         key = keys_to_try[idx]
         key_num = CONFIG['apis'].index(key) + 1
         key_level = KEY_LEVELS.get(key, 0)
         
-        # v10.9.4 FIX: 将key、key_level和一致的proxy_session传递给查询函数。
+        # 执行查询
         data, error = query_func(key, key_level, current_proxy_session_str)
         
         if not error:
-            # 返回成功使用的代理。
+            # 成功！返回数据
             return data, key, key_num, key_level, current_proxy_session_str, None
-        if "[820031]" in str(error):
-            logger.warning(f"Key [#{key_num}] F点余额不足...");
-            continue
-        # 对于其他错误，快速失败并返回问题key的信息
+        
+        # --- 故障转移逻辑 (Failover) ---
+        error_str = str(error)
+        # 检测：[820031] F点不足 或 [45022] 请求次数达上限
+        if "[820031]" in error_str or "[45022]" in error_str:
+            logger.warning(f"Key [#{key_num}] 额度耗尽 ({error_str})，自动切换下一个 Key...")
+            continue # 跳过当前 Key，尝试下一个
+            
+        # 对于其他严重错误（如网络不通、参数错误），快速失败，不浪费时间轮询
         return None, key, key_num, key_level, current_proxy_session_str, error
         
-    return None, None, None, None, None, "所有Key均尝试失败 (可能F点均不足)。"
-
+    return None, None, None, None, None, "所有可用 Key 均已尝试，额度全部耗尽，明天再来使用该bot。"
 # --- 异步扫描逻辑 ---
 async def async_check_port(host, port, timeout):
     try:
