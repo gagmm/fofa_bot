@@ -953,7 +953,9 @@ def run_sharded_download_job(context: CallbackContext):
 
     
     # 发送初始消息
-    msg = bot.send_message(chat_id, f"⏳ *启动递归二分分片下载*\n正在初始化策略引擎...", parse_mode=ParseMode.MARKDOWN_V2)
+    # 手动转义点号
+    msg = bot.send_message(chat_id, f"⏳ *启动递归二分分片下载*\n正在初始化策略引擎\.\.\.", parse_mode=ParseMode.MARKDOWN_V2)
+
 
     # --- 内部类：状态汇报器 (处理 Telegram 编辑频率限制) ---
     class StatusReporter:
