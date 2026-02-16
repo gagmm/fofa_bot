@@ -477,10 +477,14 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_s
     logger.error(f"API request failed after {retries} retries. Last error: {last_error}")
     return None, last_error if last_error else "API请求未知错误"
 def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
-def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None):
+def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None, full_mode=None):
+    # 逻辑：如果调用时传入了 full_mode，就用传入的；否则用配置文件的
+    use_full = full_mode if full_mode is not None else CONFIG.get("full_mode", False)
     
-    params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': CONFIG.get("full_mode", False)}
+    # 转换为小写字符串 'true'/'false'，确保 API 识别正确
+    params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': str(use_full).lower()}
     return _make_api_request(FOFA_SEARCH_URL, params, proxy_session=proxy_session)
+
 def fetch_fofa_stats(key, query, proxy_session=None):
     params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}
     return _make_api_request(FOFA_STATS_URL, params, proxy_session=proxy_session)
@@ -1805,13 +1809,16 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
     
     guest_key = context.user_data.get('guest_key')
     if guest_key:
-        data, error = fetch_fofa_data(guest_key, query_text, page_size=1, fields="host")
+        # 强制关闭 full 模式
+        data, error = fetch_fofa_data(guest_key, query_text, page_size=1, fields="host", full_mode=False)
         used_key_info = "您的Key"
     else:
+        # 强制关闭 full 模式
         data, _, used_key_index, _, _, error = execute_query_with_fallback(
-            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page_size=1, fields="host", proxy_session=proxy_session),
+            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page_size=1, fields="host", proxy_session=proxy_session, full_mode=False),
             preferred_key_index=key_index
         )
+
         used_key_info = f"Key \\[\\#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
     
@@ -2539,8 +2546,15 @@ def backup_config_command(update: Update, context: CallbackContext):
 
 @super_admin_only
 def restore_config_command(update: Update, context: CallbackContext):
-    update.message.reply_text("请发送您的 `config.json` 或 `.zip` 格式的备份文件。")
+    # 兼容处理：如果是按钮点击，先回应
+    if update.callback_query:
+        update.callback_query.answer()
+    
+    # 使用 effective_message，这样无论是命令还是按钮都能获取到消息对象
+    update.effective_message.reply_text("请发送您的 `config.json` 或 `.zip` 格式的备份文件。")
+    
     return RESTORE_STATE_GET_FILE
+
 def receive_config_file(update: Update, context: CallbackContext):
     global CONFIG
     doc = update.message.document
@@ -3601,7 +3615,9 @@ def main() -> None:
                 CallbackQueryHandler(show_update_menu, pattern=r"^settings_update"),
                 CallbackQueryHandler(show_backup_restore_menu, pattern=r"^settings_backup"),
                 CallbackQueryHandler(backup_config_command, pattern=r"^backup_now"),
-                CallbackQueryHandler(lambda u,c: restore_config_command(u.callback_query.message, c), pattern=r"^restore_now"),
+                # 直接传递函数，让装饰器接收完整的 Update 对象
+                CallbackQueryHandler(restore_config_command, pattern=r"^restore_now"),
+
                 CallbackQueryHandler(get_update_url, pattern=r"^update_set_url"),
                 CallbackQueryHandler(settings_command, pattern=r"^(update_back|backup_back)"),
             ],
