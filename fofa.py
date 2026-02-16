@@ -653,7 +653,7 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
         # --- 故障转移逻辑 (Failover) ---
         error_str = str(error)
         # 检测：[820031] F点不足 或 [45022] 请求次数达上限
-        if "[820031]" in error_str or "[45022]" in error_str:
+        if "[45022]" in error_str:
             logger.warning(f"Key [#{key_num}] 额度耗尽 ({error_str})，自动切换下一个 Key...")
             continue # 跳过当前 Key，尝试下一个
             
@@ -1258,7 +1258,7 @@ def run_traceback_download_query(context: CallbackContext):
             # [820041]: 每日请求次数上限
             # [820031]: F点余额不足
             # [45022]: 并发或请求限制
-            if "[820041]" in error_str or "[820031]" in error_str or "[45022]" in error_str:
+            if "[820041]" in error_str or "[45022]" in error_str:
                 logger.warning(f"Key ...{current_key[-4:]} 额度耗尽 ({error_str})，正在尝试切换...")
                 
                 # 尝试获取下一个 Key
