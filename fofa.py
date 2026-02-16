@@ -3305,7 +3305,7 @@ def run_allfofa_download_job(context: CallbackContext):
                         # 修改点：对 slice_desc 使用 escape_markdown_v2
                         msg.edit_text(
                             f"✂️ *正在剥离数据块:* `{escape_markdown_v2(slice_desc)}`\n"
-                            f"📉 策略: 时间轴降维打击 (Time Trace)\n"
+                            f"📉 策略: 时间轴降维打击 \(Time Trace\)\n"
                             f"{prog_bar} 总数: {len(collected_results)}\n"
                             f"\\(本轮新增: {trace_count_added}\\)", # 建议：这里的括号也顺手转义一下，虽然不是必须
                             parse_mode=ParseMode.MARKDOWN_V2
