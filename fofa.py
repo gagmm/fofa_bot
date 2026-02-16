@@ -37,6 +37,12 @@ from telegram.ext import (
 
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, InvalidToken
 
+CONFIG_LOCK = threading.Lock()
+HISTORY_LOCK = threading.Lock()
+MONITOR_LOCK = threading.Lock()
+DATA_LOCK = threading.Lock() # <--- 添加这一行
+
+
 # --- 全局变量和常量 ---
 API_SESSION = requests.Session()
 API_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=3)
@@ -158,6 +164,7 @@ STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
 PREVIEW_STATE_PAGINATE = 110
 
 
+
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
     if not os.path.exists(filename):
@@ -171,8 +178,19 @@ def load_json_file(filename, default_content):
     except (json.JSONDecodeError, IOError):
         logger.error(f"{filename} 损坏，将使用默认配置重建。");
         with open(filename, 'w', encoding='utf-8') as f: json.dump(default_content, f, indent=4); return default_content
-def save_json_file(filename, data):
-    with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_ascii=False)
+def save_json_file(filename, data, lock=None):
+    """
+    保存 JSON 文件，支持线程锁。
+    """
+    if lock:
+        with lock:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+    else:
+        # 如果没有传入锁，则直接写入（兼容旧调用，但建议都传锁）
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
 DEFAULT_CONFIG = { 
     "bot_token": "YOUR_BOT_TOKEN_HERE", "apis": [], "admins": [], "proxy": "", 
     "proxies": [], "full_mode": False, "public_mode": False, "presets": [], 
@@ -184,30 +202,40 @@ HISTORY = load_json_file(HISTORY_FILE, {"queries": []})
 ANONYMOUS_KEYS = load_json_file(ANONYMOUS_KEYS_FILE, {})
 SCAN_TASKS = load_json_file(SCAN_TASKS_FILE, {})
 MONITOR_TASKS = load_json_file(MONITOR_TASKS_FILE, {}) # 加载监控任务
-def save_config(): save_json_file(CONFIG_FILE, CONFIG)
-def save_anonymous_keys(): save_json_file(ANONYMOUS_KEYS_FILE, ANONYMOUS_KEYS)
+def save_config(): 
+    save_json_file(CONFIG_FILE, CONFIG, lock=CONFIG_LOCK)
+
+def save_anonymous_keys(): 
+    save_json_file(ANONYMOUS_KEYS_FILE, ANONYMOUS_KEYS, lock=DATA_LOCK)
+
 def save_scan_tasks():
     logger.info(f"Saving {len(SCAN_TASKS)} scan tasks to {SCAN_TASKS_FILE}")
-    save_json_file(SCAN_TASKS_FILE, SCAN_TASKS)
+    save_json_file(SCAN_TASKS_FILE, SCAN_TASKS, lock=DATA_LOCK)
+
 def save_monitor_tasks():
-    save_json_file(MONITOR_TASKS_FILE, MONITOR_TASKS)
+    save_json_file(MONITOR_TASKS_FILE, MONITOR_TASKS, lock=DATA_LOCK)
+
 def add_or_update_query(query_text, cache_data=None):
-    existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
-    if existing_query:
-        HISTORY['queries'].remove(existing_query); existing_query['timestamp'] = datetime.now(tz.tzutc()).isoformat()
-        if cache_data: existing_query['cache'] = cache_data
-        HISTORY['queries'].insert(0, existing_query)
-    else:
-        new_query = {"query_text": query_text, "timestamp": datetime.now(tz.tzutc()).isoformat(), "cache": cache_data}
-        HISTORY['queries'].insert(0, new_query)
-    while len(HISTORY['queries']) > MAX_HISTORY_SIZE: HISTORY['queries'].pop()
-    save_json_file(HISTORY_FILE, HISTORY)
-def find_cached_query(query_text):
-    query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
-    if query and query.get('cache'):
-        if 'file_path' in query['cache'] and os.path.exists(query['cache']['file_path']):
-            return query
-    return None
+    # 使用锁确保 修改内存数据 和 写入文件 是原子操作
+    with HISTORY_LOCK:
+        existing_query = next((q for q in HISTORY['queries'] if q['query_text'] == query_text), None)
+        if existing_query:
+            HISTORY['queries'].remove(existing_query)
+            existing_query['timestamp'] = datetime.now(tz.tzutc()).isoformat()
+            if cache_data: existing_query['cache'] = cache_data
+            HISTORY['queries'].insert(0, existing_query)
+        else:
+            new_query = {"query_text": query_text, "timestamp": datetime.now(tz.tzutc()).isoformat(), "cache": cache_data}
+            HISTORY['queries'].insert(0, new_query)
+        
+        while len(HISTORY['queries']) > MAX_HISTORY_SIZE: 
+            HISTORY['queries'].pop()
+        
+        # 这里直接调用带锁的保存，或者因为已经在 with HISTORY_LOCK 里了，
+        # 为了避免死锁，这里直接写文件，或者调用时传入 None (因为外层已经锁了)
+        # 最安全的做法是直接在这里写文件：
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f: 
+            json.dump(HISTORY, f, indent=4, ensure_ascii=False)
 
 # --- 辅助函数与装饰器 ---
 def generate_filename_from_query(query_text: str, prefix: str = "fofa", ext: str = ".txt") -> str:
@@ -260,8 +288,10 @@ def super_admin_only(func):
     return wrapped
 def escape_markdown_v2(text: str) -> str:
     if not isinstance(text, str): text = str(text)
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    # 修复：在 escape_chars 中添加了反斜杠 \
+    escape_chars = r'_*[]()~`>#+-=|{}.!\\' 
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
 def create_progress_bar(percentage: float, length: int = 10) -> str:
     if percentage < 0: percentage = 0
     if percentage > 100: percentage = 100
@@ -1246,7 +1276,8 @@ def monitor_command(update: Update, context: CallbackContext):
             return
         query_text = " ".join(args[1:])
         # 生成简短ID
-        task_id = hashlib.md5(query_text.encode()).hexdigest()[:8]
+        unique_str = f"{query_text}_{update.effective_chat.id}"
+        task_id = hashlib.md5(unique_str.encode()).hexdigest()[:8]
         
         if task_id in MONITOR_TASKS:
             # 修改点：将 ( ) 改为 \( \)
@@ -1438,14 +1469,20 @@ def run_monitor_execution_job(context: CallbackContext):
 # --- 核心命令处理 ---
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
-    welcome_text = f'👋 欢迎, {user.first_name}！\n请选择一个操作:'
-    update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    # 1. 修改欢迎语，提示用户使用 /help 查看指令（因为没有按钮了）
+    welcome_text = f'👋 欢迎, {user.first_name}！\n机器人已启动，请使用 /help 查看可用指令。'
+    
+    # 2. 发送消息（删除了原本报错的 reply_markup 参数）
+    update.message.reply_text(welcome_text)
 
+    # 3. 保留原有的管理员初始化逻辑（如果配置文件中没有管理员，则将当前用户设为管理员）
     if not CONFIG['admins']:
         first_admin_id = update.effective_user.id
         CONFIG.setdefault('admins', []).append(first_admin_id)
         save_config()
-        update.message.reply_text(f"ℹ️ 已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。")
+        # 使用 Markdown 格式通知，注意转义 ID
+        update.message.reply_text(f"ℹ️ 检测到管理员列表为空。\n已自动将您 (ID: `{first_admin_id}`) 添加为第一个管理员。", parse_mode=ParseMode.MARKDOWN_V2)
+
 
 def help_command(update: Update, context: CallbackContext):
     help_text = ( "📖 *Fofa 机器人指令手册 v10\\.9*\n\n"
@@ -2896,7 +2933,8 @@ def monitor_menu_callback(update: Update, context: CallbackContext):
 
 def get_monitor_query_to_add(update: Update, context: CallbackContext):
     query_text = update.message.text.strip()
-    task_id = hashlib.md5(query_text.encode()).hexdigest()[:8]
+    unique_str = f"{query_text}_{update.effective_chat.id}"
+    task_id = hashlib.md5(unique_str.encode()).hexdigest()[:8]
     if task_id in MONITOR_TASKS:
         update.message.reply_text(f"⚠️ 任务已存在 (ID: `{task_id}`)", parse_mode=ParseMode.MARKDOWN_V2)
     else:
