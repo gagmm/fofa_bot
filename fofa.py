@@ -478,8 +478,9 @@ def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_s
     return None, last_error if last_error else "API请求未知错误"
 def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
 def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None, full_mode=None):
-    # 逻辑：如果调用时传入了 full_mode，就用传入的；否则用配置文件的
+    # 逻辑：优先使用传入的 full_mode，否则读取配置
     use_full = full_mode if full_mode is not None else CONFIG.get("full_mode", False)
+    # ...
     
     # 转换为小写字符串 'true'/'false'，确保 API 识别正确
     params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': str(use_full).lower()}
@@ -1800,10 +1801,16 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
     else:
         # 强制关闭 full 模式
         data, _, used_key_index, _, _, error = execute_query_with_fallback(
-            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page_size=1, fields="host", proxy_session=proxy_session, full_mode=False),
-            preferred_key_index=key_index
-        )
-
+        lambda key, key_level, proxy_session: fetch_fofa_data(
+            key, 
+            query_text, 
+            page_size=1, 
+            fields="host", 
+            proxy_session=proxy_session, 
+            full_mode=False  # <--- 必须显式加上这个！
+        ),
+        preferred_key_index=key_index
+    )
         used_key_info = f"Key \\[\\#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
     
