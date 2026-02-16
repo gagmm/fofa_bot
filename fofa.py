@@ -934,82 +934,220 @@ def run_full_download_query(context: CallbackContext):
 
 def run_sharded_download_job(context: CallbackContext):
     """
-    智能分片下载任务：按国家代码将查询拆分，绕过单次查询10000条的限制。
+    智能分片下载任务（递归二分策略 + 实时状态反馈）：
+    1. Big N 分离：CN, US, RU 单独处理。
+    2. 递归二分：对剩余国家的集合进行 Size Check。
+    3. 实时更新 Telegram 界面，显示当前递归深度和处理阶段。
     """
     job_data = context.job.context
     bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']
     
-    output_filename = generate_filename_from_query(base_query, prefix="sharded")
+    output_filename = generate_filename_from_query(base_query, prefix="smart_sharded")
     unique_results = set()
     stop_flag = f'stop_job_{chat_id}'
     
-    msg = bot.send_message(chat_id, f"⏳ *启动智能分片下载*\n目标：将查询按 {len(ALL_COUNTRY_CODES)} 个国家区域拆分\\.\\.\\.\n注意：此模式将消耗较多的 API 请求次数。", parse_mode=ParseMode.MARKDOWN_V2)
+    # 定义 Big N (数据量通常巨大的国家)
+    # CN=中国, US=美国, DE=德国, JP=日本, RU=俄罗斯
+    # GB=英国, FR=法国, NL=荷兰, CA=加拿大, KR=韩国
+    BIG_N = ['CN', 'US', 'DE', 'JP', 'RU', 'GB', 'FR', 'NL', 'CA', 'KR']
+
     
-    start_time = time.time()
-    last_ui_update_time = 0
-    total_codes = len(ALL_COUNTRY_CODES)
-    
-    # 遍历所有国家
-    for i, country_code in enumerate(ALL_COUNTRY_CODES):
-        if context.bot_data.get(stop_flag):
-            try: msg.edit_text("🛑 任务已手动停止。")
-            except (BadRequest, RetryAfter, TimedOut): pass
-            break
+    # 发送初始消息
+    msg = bot.send_message(chat_id, f"⏳ *启动递归二分分片下载*\n正在初始化策略引擎...", parse_mode=ParseMode.MARKDOWN_V2)
+
+    # --- 内部类：状态汇报器 (处理 Telegram 编辑频率限制) ---
+    class StatusReporter:
+        def __init__(self, message_obj):
+            self.msg = message_obj
+            self.last_update_time = 0
+            self.current_stage = "初始化"
+            self.total_found = 0
+            self.start_time = time.time()
+
+        def update(self, stage, force=False):
+            self.current_stage = stage
+            now = time.time()
+            # 限制更新频率：每 2.5 秒更新一次，或者强制更新
+            if force or (now - self.last_update_time > 2.5):
+                try:
+                    elapsed = int(now - self.start_time)
+                    text = (
+                        f"🚀 *智能分片引擎运行中...*\n"
+                        f"⏱ 耗时: {elapsed}s\n"
+                        f"📊 已收集: *{self.total_found}* 条\n"
+                        f"🔧 *当前阶段: {escape_markdown_v2(self.current_stage)}*\n"
+                        f"💡 策略: 递归二分 \\+ 深度追溯"
+                    )
+                    self.msg.edit_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+                    self.last_update_time = now
+                except (BadRequest, RetryAfter, TimedOut):
+                    pass # 忽略网络波动或频率限制报错
+
+    reporter = StatusReporter(msg)
+
+    # 准备 Key 和 Proxy
+    guest_key = job_data.get('guest_key')
+    proxy_session = None 
+    if not guest_key:
+         # 预热一个代理会话
+         _, _, _, _, proxy_session, _ = execute_query_with_fallback(lambda k, l, p: (None, None))
+
+    # --- 辅助函数：深度追溯下载 (针对单国 > 10k 的情况) ---
+    def download_deep_trace(query_scope, country_code):
+        reporter.update(f"深度追溯: {country_code} (数据量过大)", force=True)
+        try:
+            # 如果是 Guest Key，无法使用深度追溯，只能拿前 10k
+            if guest_key:
+                d, _ = fetch_fofa_data(guest_key, query_scope, page=1, page_size=10000, fields="host")
+                if d and d.get('results'):
+                    res = [r[0] if isinstance(r, list) else r for r in d['results']]
+                    reporter.total_found += len(res)
+                    return res
+                return []
+
+            # 正式追溯
+            collected = []
+            # 获取一个可用的 key 用于迭代器
+            _, valid_key, _, _, _, _ = execute_query_with_fallback(lambda k,l,p: (True, None))
             
-        current_time = time.time()
-        # 更新进度UI (每2秒最多更新一次)
-        if current_time - last_ui_update_time > 2 or i == 0:
-            elapsed = current_time - start_time
-            speed = len(unique_results) / elapsed if elapsed > 0 else 0
-            progress_bar = create_progress_bar((i / total_codes) * 100)
-            try:
-                msg.edit_text(
-                    f"🌍 *正在分片扫描...* `{country_code}`\n"
-                    f"{escape_markdown_v2(progress_bar)} {i}/{total_codes}\n"
-                    f"已收集数据: *{len(unique_results)}* 条\n"
-                    f"当前平均速度: *{int(speed)}* 条/秒",
-                    parse_mode=ParseMode.MARKDOWN_V2
-                )
-                last_ui_update_time = current_time
-            except (BadRequest, RetryAfter, TimedOut):
-                pass
+            iterator = iter_fofa_traceback(valid_key, query_scope, limit=None, proxy_session=proxy_session)
+            
+            for batch in iterator:
+                if context.bot_data.get(stop_flag): break
+                valid_items = [item[0] for item in batch if item and isinstance(item, list) and len(item)>0]
+                
+                # 增量去重计数
+                new_count = 0
+                for item in valid_items:
+                    if item not in unique_results: # 注意：这里引用外部 unique_results 只是为了计数准确性，实际添加在外部
+                        new_count += 1
+                
+                collected.extend(valid_items)
+                reporter.total_found += new_count # 更新显示计数
+                reporter.update(f"深度追溯 {country_code}: 已抓取 {len(collected)} 条")
+            
+            return collected
+        except Exception as e:
+            logger.error(f"Deep trace failed: {e}")
+            return []
 
-        # 构造分片查询
-        sharded_query = f'({base_query}) && country="{country_code}"'
-        
-        # 内部查询函数
-        def query_logic(key, key_level, proxy_session):
-            # 为了节省流量和速度，默认只请求第一页 (max 10000 per country is usually enough for most cases)
-            return fetch_fofa_data(key, sharded_query, page=1, page_size=10000, fields="host", proxy_session=proxy_session)
+    # --- 核心递归函数 ---
+    def process_country_group(countries, depth=0):
+        if not countries: return
+        if context.bot_data.get(stop_flag): return
 
-        # 尝试查询
-        guest_key = job_data.get('guest_key')
-        if guest_key:
-            data, error = fetch_fofa_data(guest_key, sharded_query, page=1, page_size=10000, fields="host")
+        # 构造组名用于显示
+        if len(countries) == 1:
+            group_desc = f"国家 {countries[0]}"
         else:
-            data, _, _, _, _, error = execute_query_with_fallback(query_logic)
-        
-        # 处理结果
-        if not error and data and data.get('results'):
-            new_data = data['results']
-            # 处理简单字符串结果或列表结果
-            extracted_hosts = []
-            if new_data and isinstance(new_data[0], list):
-                 extracted_hosts = [r[0] for r in new_data if r and r[0] and ':' in r[0]]
-            else:
-                 extracted_hosts = [r for r in new_data if isinstance(r, str) and ':' in r]
-            
-            unique_results.update(extracted_hosts)
-            
-            # (可选优化) 如果单个国家结果也是满的 10000，理想情况应该再对该国家按 region 分片
-            # 但这里为了避免无限递归，暂时接受单个分片 10000 的上限。对于绝大多数国家已足够。
+            group_desc = f"国家组 ({len(countries)}个, 如 {countries[0]}...)"
 
-    # 循环结束后的收尾
+        reporter.update(f"侦察: {group_desc}")
+
+        # 1. 构造查询
+        country_condition = " || ".join([f'country="{c}"' for c in countries])
+        group_query = f'({base_query}) && ({country_condition})'
+        
+        # 2. 侦察 Size
+        if guest_key:
+            data_check, error = fetch_fofa_data(guest_key, group_query, page_size=1, fields="host")
+        else:
+            data_check, _, _, _, _, error = execute_query_with_fallback(
+                lambda k, l, ps: fetch_fofa_data(k, group_query, page_size=1, fields="host", proxy_session=ps),
+                proxy_session=proxy_session
+            )
+        
+        if error:
+            logger.warning(f"侦察失败: {error}")
+            return
+            
+        size = data_check.get('size', 0)
+
+        if size == 0:
+            # 无数据，直接跳过
+            return
+
+        # 3. 决策分支
+        if size <= 10000:
+            # --- 分支 A: 直接打包下载 ---
+            reporter.update(f"下载: {group_desc} (包含 {size} 条)")
+            
+            if guest_key:
+                data, _ = fetch_fofa_data(guest_key, group_query, page=1, page_size=10000, fields="host")
+            else:
+                data, _, _, _, _, _ = execute_query_with_fallback(
+                    lambda k, l, ps: fetch_fofa_data(k, group_query, page=1, page_size=10000, fields="host", proxy_session=ps),
+                    proxy_session=proxy_session
+                )
+            
+            if data and data.get('results'):
+                new_res = [r[0] for r in data['results'] if isinstance(r, list)] if isinstance(data['results'][0], list) else data['results']
+                
+                # 计数并更新
+                added_count = 0
+                for r in new_res:
+                    if isinstance(r, str) and ':' in r and r not in unique_results:
+                        unique_results.add(r)
+                        added_count += 1
+                
+                reporter.total_found += added_count
+                
+        else:
+            # --- 分支 B: 数据量 > 10000，需要处理 ---
+            
+            # B1. 如果只剩 1 个国家，无法再分 -> 降级为深度追溯
+            if len(countries) == 1:
+                target_country = countries[0]
+                traced_data = download_deep_trace(group_query, target_country)
+                
+                for r in traced_data:
+                    if r not in unique_results:
+                        unique_results.add(r)
+                return
+
+            # B2. 还有多个国家 -> 二分拆解 (Recursion)
+            reporter.update(f"拆分: {group_desc} 数据量({size}) > 10k, 正在二分...")
+            
+            mid = len(countries) // 2
+            group_a = countries[:mid]
+            group_b = countries[mid:]
+            
+            process_country_group(group_a, depth=depth+1)
+            process_country_group(group_b, depth=depth+1)
+
+
+    # --- 主流程开始 ---
+
+    # 1. 收集所有非 Big N 的国家代码
+    all_other_countries = []
+    for continent, countries in CONTINENT_COUNTRIES.items():
+        for c in countries:
+            if c not in BIG_N:
+                all_other_countries.append(c)
+    
+    # 去重并排序
+    all_other_countries = sorted(list(set(all_other_countries)))
+
+    # 2. 处理 Big N (单独优先处理)
+    for i, big_c in enumerate(BIG_N):
+        if context.bot_data.get(stop_flag): break
+        reporter.update(f"处理 Big 3: {big_c} ({i+1}/{len(BIG_N)})")
+        process_country_group([big_c])
+
+    # 3. 处理剩余世界 (作为一整个大组开始递归)
+    if not context.bot_data.get(stop_flag):
+        reporter.update(f"处理剩余世界: {len(all_other_countries)} 个国家")
+        process_country_group(all_other_countries)
+
+    # --- 结果处理 ---
     context.bot_data.pop(stop_flag, None)
+    
+    # 最后强制更新一次状态
+    reporter.update("任务完成，正在打包...", force=True)
     
     if unique_results:
         final_count = len(unique_results)
-        msg.edit_text(f"✅ 分片扫描完成\!\n总计发现 *{final_count}* 条唯一数据。\n正在生成并发送文件\.\.\.", parse_mode=ParseMode.MARKDOWN_V2)
+        msg.edit_text(f"✅ 智能分片完成\!\n总计发现 *{final_count}* 条唯一数据。\n正在生成并发送文件\.\.\.", parse_mode=ParseMode.MARKDOWN_V2)
         
         with open(output_filename, 'w', encoding='utf-8') as f:
             f.write("\n".join(sorted(list(unique_results))))
@@ -1023,246 +1161,212 @@ def run_sharded_download_job(context: CallbackContext):
         add_or_update_query(base_query, cache_data)
         offer_post_download_actions(context, chat_id, base_query)
     else:
-        msg.edit_text("🤷‍♀️ 任务完成，但在任何国家分片中都未找到数据。")
+        msg.edit_text("🤷‍♀️ 任务完成，但未找到任何数据。")
+
+# 在 run_traceback_download_query 函数内部或上方定义
+def get_next_valid_key(current_key, min_level=1):
+    """寻找下一个可用的 VIP Key"""
+    apis = CONFIG.get('apis', [])
+    if not apis: return None
+    
+    try:
+        current_index = apis.index(current_key)
+    except ValueError:
+        current_index = -1
+        
+    # 从当前 Key 的下一个开始找
+    for i in range(1, len(apis) + 1):
+        next_idx = (current_index + i) % len(apis)
+        candidate_key = apis[next_idx]
+        # 确保 Key 等级足够（追溯通常需要 VIP，即 level >= 1）
+        if KEY_LEVELS.get(candidate_key, 0) >= min_level:
+            return candidate_key
+            
+    return None
 
 def run_traceback_download_query(context: CallbackContext):
-    job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; limit = job_data.get('limit')
-    output_filename = generate_filename_from_query(base_query); unique_results, page_count, last_page_date, termination_reason, stop_flag, last_update_time = set(), 0, None, "", f'stop_job_{chat_id}', 0
+    job_data = context.job.context
+    bot, chat_id = context.bot, job_data['chat_id']
+    base_query = job_data['query']
+    limit = job_data.get('limit')
+    
+    output_filename = generate_filename_from_query(base_query)
+    unique_results = set()
+    page_count = 0
+    last_page_date = None
+    termination_reason = ""
+    stop_flag = f'stop_job_{chat_id}'
+    last_update_time = 0
+    
     msg = bot.send_message(chat_id, "⏳ 开始深度追溯下载...")
+    
+    # 初始化查询参数
     current_query = base_query
+    
+    # 确定初始 Key (优先使用传入的 key，否则找一个)
+    # 注意：这里我们不再使用 execute_query_with_fallback 的自动轮询，
+    # 而是手动控制，因为我们需要保持时间锚点(last_page_date)的一致性。
+    
+    # 1. 找到一个初始的高级 Key
+    current_key = None
     guest_key = job_data.get('guest_key')
     
-    # v10.9.4 FIX: 为整个追溯过程锁定一个代理会话
-    locked_proxy_session = None
+    if guest_key:
+        current_key = guest_key
+    else:
+        # 找一个 level >= 1 的 key
+        for k in CONFIG.get('apis', []):
+            if KEY_LEVELS.get(k, 0) >= 1:
+                current_key = k
+                break
+    
+    if not current_key:
+        msg.edit_text("❌ 无法启动：没有找到 VIP 等级以上的 Key (深度追溯需要查询 lastupdatetime)。")
+        return
 
-    while True:
+    # 锁定一个代理 session
+    proxy_session = get_proxies() 
+    if proxy_session: proxy_session = proxy_session.get('http') # 简化处理，复用现有逻辑
+
+    while True: # 主循环：每一页
         page_count += 1
-        if context.bot_data.get(stop_flag): termination_reason = "\n\n🌀 任务已手动停止."; break
+        if context.bot_data.get(stop_flag): 
+            termination_reason = "\n\n🌀 任务已手动停止."
+            break
 
-        fields_were_extended = False
-        if guest_key:
-            # Guest keys are assumed to be low-level, don't request lastupdatetime
-            data, error = fetch_fofa_data(guest_key, current_query, 1, 10000, fields="host")
-        else:
-            def query_logic(key, key_level, proxy_session):
-                nonlocal fields_were_extended
-                # Personal members and above can search this field.
-                if key_level >= 1:
-                    fields_were_extended = True
-                    return fetch_fofa_data(key, current_query, 1, 10000, fields="host,lastupdatetime", proxy_session=proxy_session)
-                else:
-                    fields_were_extended = False
-                    return fetch_fofa_data(key, current_query, 1, 10000, fields="host", proxy_session=proxy_session)
+        # --- API 请求重试与切换 Key 循环 ---
+        data = None
+        error = None
+        
+        while True: # 内循环：当前页的重试/切换Key
+            # 构造请求
+            # 注意：这里我们直接用 fetch_fofa_data，因为我们要手动处理 Key 切换
+            # 只有 VIP (level>=1) 才能查 lastupdatetime
+            fields = "host,lastupdatetime"
             
-            # 仅在第一次迭代时选择并锁定代理
-            if locked_proxy_session is None:
-                data, _, _, _, locked_proxy_session, error = execute_query_with_fallback(query_logic)
+            # 发起请求
+            data, error = fetch_fofa_data(current_key, current_query, page=1, page_size=10000, fields=fields, proxy_session=proxy_session)
+            
+            if not error:
+                break # 请求成功，跳出内循环，处理数据
+            
+            error_str = str(error)
+            
+            # 检查是否是额度耗尽错误
+            # [820041]: 每日请求次数上限
+            # [820031]: F点余额不足
+            # [45022]: 并发或请求限制
+            if "[820041]" in error_str or "[820031]" in error_str or "[45022]" in error_str:
+                logger.warning(f"Key ...{current_key[-4:]} 额度耗尽 ({error_str})，正在尝试切换...")
+                
+                # 尝试获取下一个 Key
+                next_key = None
+                apis = CONFIG.get('apis', [])
+                if apis and current_key in apis:
+                    curr_idx = apis.index(current_key)
+                    # 轮询找下一个 VIP Key
+                    for i in range(1, len(apis)):
+                        candidate = apis[(curr_idx + i) % len(apis)]
+                        if KEY_LEVELS.get(candidate, 0) >= 1:
+                            next_key = candidate
+                            break
+                
+                if next_key and next_key != current_key:
+                    msg.edit_text(f"⚠️ Key ...{current_key[-4:]} 额度耗尽，自动切换到 ...{next_key[-4:]} 继续追溯...")
+                    current_key = next_key
+                    time.sleep(1) # 稍作停顿
+                    continue # 换了 Key，重新请求当前这一页
+                else:
+                    # 没 Key 可换了
+                    termination_reason = f"\n\n❌ 所有可用 Key 额度均已耗尽，任务终止于第 {page_count} 轮。"
+                    break # 跳出内循环，这会导致外层循环也因为 error 存在而退出
             else:
-                data, _, _, _, _, error = execute_query_with_fallback(query_logic, proxy_session=locked_proxy_session)
+                # 其他网络错误，不换 Key，直接报错退出
+                break 
+        
+        # --- 错误处理 ---
+        if error: 
+            if not termination_reason:
+                termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"
+            break
 
-        if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
+        # --- 数据处理 ---
         results = data.get('results', [])
-        if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
+        if not results: 
+            termination_reason = "\n\nℹ️ 已获取所有查询结果 (无更多数据)."
+            break
 
-        if fields_were_extended:
-            newly_added = [r[0] for r in results if r and r[0] and ':' in r[0]]
-        else:
-            newly_added = [r for r in results if r and ':' in r]
+        # 提取 host (results 是 [host, lastupdatetime] 的列表)
+        newly_added = [r[0] for r in results if r and len(r) > 0 and ':' in r[0]]
         
         original_count = len(unique_results)
         unique_results.update(newly_added)
         newly_added_count = len(unique_results) - original_count
 
-        if limit and len(unique_results) >= limit: unique_results = set(list(unique_results)[:limit]); termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"; break
+        # 检查总上限
+        if limit and len(unique_results) >= limit: 
+            unique_results = set(list(unique_results)[:limit])
+            termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"
+            break
+            
+        # 更新 UI
         current_time = time.time()
         if current_time - last_update_time > 2:
-            try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
+            try: 
+                msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})\n当前时间锚点: {last_page_date or '初始'}")
             except (BadRequest, RetryAfter, TimedOut): pass
             last_update_time = current_time
 
-        if not fields_were_extended:
-             termination_reason = "\n\n⚠️ 当前Key等级不支持时间追溯，已获取第一页结果。"
-             break
-        
+        # --- 时间锚点推移 (Time Slicing) ---
         valid_anchor_found = False
+        # 倒序遍历结果，寻找最早的时间
         for i in range(len(results) - 1, -1, -1):
             if not results[i] or len(results[i]) < 2 or not results[i][1]: continue
             try:
-                timestamp_str = results[i][1]; current_date_obj = datetime.strptime(timestamp_str.split(' ')[0], '%Y-%m-%d').date()
+                timestamp_str = results[i][1] # "2023-01-01 12:00:00"
+                current_date_obj = datetime.strptime(timestamp_str.split(' ')[0], '%Y-%m-%d').date()
+                
+                # 如果找到的时间比上一轮的还晚(或相等)，说明没往前走，跳过
                 if last_page_date and current_date_obj >= last_page_date: continue
+                
                 next_page_date_obj = current_date_obj
-                if last_page_date and current_date_obj == last_page_date: next_page_date_obj -= timedelta(days=1)
-                last_page_date = current_date_obj; current_query = f'({base_query}) && before="{next_page_date_obj.strftime("%Y-%m-%d")}"'; valid_anchor_found = True
+                
+                # 如果这一页最后一条的时间 == 上一页的时间锚点，强制 -1 天防止死循环
+                if last_page_date and current_date_obj == last_page_date: 
+                    next_page_date_obj -= timedelta(days=1)
+                
+                last_page_date = next_page_date_obj
+                
+                # 更新查询语句：追加 before 参数
+                # 注意：这里要基于 base_query 重新构建，而不是在 current_query 上无限叠加
+                current_query = f'({base_query}) && before="{next_page_date_obj.strftime("%Y-%m-%d")}"'
+                valid_anchor_found = True
                 break
             except (ValueError, TypeError): continue
-        if not valid_anchor_found: termination_reason = "\n\n⚠️ 无法找到有效的时间锚点以继续，可能已达查询边界."; break
+            
+        if not valid_anchor_found: 
+            termination_reason = "\n\n⚠️ 无法找到更早的时间锚点，可能已达查询边界或当日数据量过大无法切分。"
+            break
+
+    # --- 结果保存与发送 ---
     if unique_results:
-        with open(output_filename, 'w', encoding='utf-8') as f: f.write("\n".join(sorted(list(unique_results))))
-        msg.edit_text(f"✅ 深度追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...")
+        # 即使报错退出，也保存已下载的数据
+        with open(output_filename, 'w', encoding='utf-8') as f: 
+            f.write("\n".join(sorted(list(unique_results))))
+            
+        msg.edit_text(f"✅ 深度追溯结束！共 {len(unique_results)} 条。{termination_reason}\n正在发送文件...")
+        
         cache_path = os.path.join(FOFA_CACHE_DIR, output_filename)
         shutil.move(output_filename, cache_path)
         send_file_safely(context, chat_id, cache_path, filename=output_filename)
         upload_and_send_links(context, chat_id, cache_path)
+        
         cache_data = {'file_path': cache_path, 'result_count': len(unique_results)}
-        add_or_update_query(base_query, cache_data); offer_post_download_actions(context, chat_id, base_query)
-    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
-    context.bot_data.pop(stop_flag, None)
-def run_incremental_update_query(context: CallbackContext):
-    job_data = context.job.context; bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']; msg = bot.send_message(chat_id, "--- 增量更新启动 ---")
-    try: msg.edit_text("1/5: 正在获取旧缓存...")
-    except (BadRequest, RetryAfter, TimedOut): pass
-    cached_item = find_cached_query(base_query)
-    if not cached_item: msg.edit_text("❌ 错误：找不到本地缓存项。"); return
-    old_file_path = cached_item['cache']['file_path']; old_results = set()
-    try:
-        with open(old_file_path, 'r', encoding='utf-8') as f: old_results = set(line.strip() for line in f if line.strip() and ':' in line)
-    except Exception as e: msg.edit_text(f"❌ 读取本地缓存文件失败: {e}"); return
-    try: msg.edit_text("2/5: 正在确定更新起始点...")
-    except (BadRequest, RetryAfter, TimedOut): pass
-    data, _, _, _, _, error = execute_query_with_fallback(
-        lambda key, key_level, proxy_session: fetch_fofa_data(key, base_query, fields="lastupdatetime", proxy_session=proxy_session)
-    )
-    if error or not data.get('results'): msg.edit_text(f"❌ 无法获取最新记录时间戳: {error or '无结果'}"); return
-    ts_str = data['results'][0][0] if isinstance(data['results'][0], list) else data['results'][0]; cutoff_date = ts_str.split(' ')[0]
-    incremental_query = f'({base_query}) && after="{cutoff_date}"'
-    try: msg.edit_text(f"3/5: 正在侦察自 {cutoff_date} 以来的新数据...")
-    except (BadRequest, RetryAfter, TimedOut): pass
-    data, _, _, _, _, error = execute_query_with_fallback(
-        lambda key, key_level, proxy_session: fetch_fofa_data(key, incremental_query, page_size=1, proxy_session=proxy_session)
-    )
-    if error: msg.edit_text(f"❌ 侦察查询失败: {error}"); return
-    total_new_size = data.get('size', 0)
-    if total_new_size == 0: msg.edit_text("✅ 未发现新数据。缓存已是最新。"); return
-    new_results, stop_flag = set(), f'stop_job_{chat_id}'; pages_to_fetch = (total_new_size + 9999) // 10000
-    for page in range(1, pages_to_fetch + 1):
-        if context.bot_data.get(stop_flag):
-            try: msg.edit_text("🌀 增量更新已手动停止。")
-            except (BadRequest, RetryAfter, TimedOut): pass
-            return
-        try: msg.edit_text(f"3/5: 正在下载新数据... ( Page {page}/{pages_to_fetch} )")
-        except (BadRequest, RetryAfter, TimedOut): pass
-        data, _, _, _, _, error = execute_query_with_fallback(
-            lambda key, key_level, proxy_session: fetch_fofa_data(key, incremental_query, page=page, page_size=10000, proxy_session=proxy_session)
-        )
-        if error: msg.edit_text(f"❌ 下载新数据失败: {error}"); return
-        if data.get('results'): new_results.update(res for res in data.get('results', []) if ':' in res)
-    try: msg.edit_text(f"4/5: 正在合并数据... (发现 {len(new_results)} 条新数据)")
-    except (BadRequest, RetryAfter, TimedOut): pass
-    combined_results = sorted(list(new_results.union(old_results)))
-    with open(old_file_path, 'w', encoding='utf-8') as f: f.write("\n".join(combined_results))
-    try: msg.edit_text(f"5/5: 发送更新后的文件... (共 {len(combined_results)} 条)")
-    except (BadRequest, RetryAfter, TimedOut): pass
-    send_file_safely(context, chat_id, old_file_path)
-    upload_and_send_links(context, chat_id, old_file_path)
-    cache_data = {'file_path': old_file_path, 'result_count': len(combined_results)}
-    add_or_update_query(base_query, cache_data)
-    msg.delete(); bot.send_message(chat_id, f"✅ 增量更新完成！"); offer_post_download_actions(context, chat_id, base_query)
-def run_batch_download_query(context: CallbackContext):
-    job_data = context.job.context; bot, chat_id, query_text, total_size, fields = context.bot, job_data['chat_id'], job_data['query'], job_data['total_size'], job_data['fields']
-    output_filename = generate_filename_from_query(query_text, prefix="batch_export", ext=".csv"); results_list, stop_flag = [], f'stop_job_{chat_id}'
-    msg = bot.send_message(chat_id, "⏳ 开始自定义字段批量导出任务..."); pages_to_fetch = (total_size + 9999) // 10000
-    for page in range(1, pages_to_fetch + 1):
-        if context.bot_data.get(stop_flag): msg.edit_text("🌀 下载任务已手动停止."); break
-        try: msg.edit_text(f"下载进度: {len(results_list)}/{total_size} (Page {page}/{pages_to_fetch})...")
-        except (BadRequest, RetryAfter, TimedOut): pass
-        data, _, _, _, _, error = execute_query_with_fallback(
-            lambda key, key_level, proxy_session: fetch_fofa_data(key, query_text, page, 10000, fields, proxy_session=proxy_session)
-        )
-        if error: msg.edit_text(f"❌ 第 {page} 页下载出错: {error}"); break
-        page_results = data.get('results', [])
-        if not page_results: break
-        results_list.extend(page_results)
-    if results_list:
-        msg.edit_text(f"✅ 下载完成！共 {len(results_list)} 条。正在生成CSV文件...")
-        try:
-            with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(results_list)
-            send_file_safely(context, chat_id, output_filename, caption=f"✅ 自定义导出完成\n查询: `{escape_markdown_v2(query_text)}`", parse_mode=ParseMode.MARKDOWN_V2)
-            upload_and_send_links(context, chat_id, output_filename)
-        except Exception as e:
-            msg.edit_text(f"❌ 生成或发送CSV文件失败: {e}"); logger.error(f"Failed to generate/send CSV for batch command: {e}")
-        finally:
-            if os.path.exists(output_filename): os.remove(output_filename)
-            msg.delete()
-    elif not context.bot_data.get(stop_flag): msg.edit_text("🤷‍♀️ 任务完成，但未能下载到任何数据。")
-    context.bot_data.pop(stop_flag, None)
-def run_batch_traceback_query(context: CallbackContext):
-    job_data = context.job.context; bot, chat_id, base_query, fields, limit = context.bot, job_data['chat_id'], job_data['query'], job_data['fields'], job_data.get('limit')
-    output_filename = generate_filename_from_query(base_query, prefix="batch_traceback", ext=".csv")
-    unique_results, page_count, last_page_date, termination_reason, stop_flag, last_update_time = [], 0, None, "", f'stop_job_{chat_id}', 0
-    msg = bot.send_message(chat_id, "⏳ 开始自定义字段深度追溯下载...")
-    current_query = base_query; seen_hashes = set()
-    
-    # v10.9.4 FIX: 为整个追溯过程锁定一个代理会话
-    locked_proxy_session = None
-
-    while True:
-        page_count += 1
-        if context.bot_data.get(stop_flag): termination_reason = "\n\n🌀 任务已手动停止."; break
+        add_or_update_query(base_query, cache_data)
+        offer_post_download_actions(context, chat_id, base_query)
+    else: 
+        msg.edit_text(f"🤷‍♀️ 任务结束，但未能下载到任何数据。{termination_reason}")
         
-        fields_were_extended = False
-        def query_logic(key, key_level, proxy_session):
-            nonlocal fields_were_extended
-            if key_level >= 1:
-                fields_were_extended = True
-                return fetch_fofa_data(key, current_query, 1, 10000, fields=fields + ",lastupdatetime", proxy_session=proxy_session)
-            else:
-                fields_were_extended = False
-                return fetch_fofa_data(key, current_query, 1, 10000, fields=fields, proxy_session=proxy_session)
-
-        # 仅在第一次迭代时选择并锁定代理
-        if locked_proxy_session is None:
-            data, _, _, _, locked_proxy_session, error = execute_query_with_fallback(query_logic)
-        else:
-            data, _, _, _, _, error = execute_query_with_fallback(query_logic, proxy_session=locked_proxy_session)
-
-        if error: termination_reason = f"\n\n❌ 第 {page_count} 轮出错: {error}"; break
-        results = data.get('results', [])
-        if not results: termination_reason = "\n\nℹ️ 已获取所有查询结果."; break
-
-        newly_added_count = 0
-        for r in results:
-            r_hash = hashlib.md5(str(r).encode()).hexdigest()
-            if r_hash not in seen_hashes:
-                seen_hashes.add(r_hash)
-                unique_results.append(r[:-1] if fields_were_extended else r)
-                newly_added_count += 1
-        if limit and len(unique_results) >= limit: unique_results = unique_results[:limit]; termination_reason = f"\n\nℹ️ 已达到您设置的 {limit} 条结果上限。"; break
-        current_time = time.time()
-        if current_time - last_update_time > 2:
-            try: msg.edit_text(f"⏳ 已找到 {len(unique_results)} 条... (第 {page_count} 轮, 新增 {newly_added_count})")
-            except (BadRequest, RetryAfter, TimedOut): pass
-            last_update_time = current_time
-
-        if not fields_were_extended:
-             termination_reason = "\n\n⚠️ 当前Key等级不支持时间追溯，已获取第一页结果。"
-             break
-        
-        valid_anchor_found = False
-        for i in range(len(results) - 1, -1, -1):
-            if not results[i] or len(results[i]) < 2 or not results[i][-1]: continue
-            try:
-                timestamp_str = results[i][-1]; current_date_obj = datetime.strptime(timestamp_str.split(' ')[0], '%Y-%m-%d').date()
-                if last_page_date and current_date_obj >= last_page_date: continue
-                next_page_date_obj = current_date_obj
-                if last_page_date and current_date_obj == last_page_date: next_page_date_obj -= timedelta(days=1)
-                last_page_date = current_date_obj; current_query = f'({base_query}) && before="{next_page_date_obj.strftime("%Y-%m-%d")}"'; valid_anchor_found = True
-                break
-            except (ValueError, TypeError): continue
-        if not valid_anchor_found: termination_reason = "\n\n⚠️ 无法找到有效的时间锚点以继续，可能已达查询边界."; break
-    if unique_results:
-        msg.edit_text(f"✅ 追溯完成！共 {len(unique_results)} 条。{termination_reason}\n正在生成CSV...")
-        try:
-            with open(output_filename, 'w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.writer(f); writer.writerow(fields.split(',')); writer.writerows(unique_results)
-            send_file_safely(context, chat_id, output_filename)
-            upload_and_send_links(context, chat_id, output_filename)
-        except Exception as e:
-            msg.edit_text(f"❌ 生成或发送CSV文件失败: {e}"); logger.error(f"Failed to generate/send CSV for batch traceback: {e}")
-        finally:
-            if os.path.exists(output_filename): os.remove(output_filename)
-            msg.delete()
-    else: msg.edit_text(f"🤷‍♀️ 任务完成，但未能下载到任何数据。{termination_reason}")
     context.bot_data.pop(stop_flag, None)
 
 # --- 监控系统 (Data Reservoir + Radar Mode) ---
