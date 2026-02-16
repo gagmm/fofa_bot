@@ -939,9 +939,9 @@ def run_full_download_query(context: CallbackContext):
 def run_sharded_download_job(context: CallbackContext):
     """
     智能分片下载任务（递归二分策略 + 实时状态反馈）：
-    1. Big N 分离：CN, US, RU 单独处理。
-    2. 递归二分：对剩余国家的集合进行 Size Check。
-    3. 实时更新 Telegram 界面，显示当前递归深度和处理阶段。
+    1. Big N 分离：CN, US, RU 等单独处理。
+    2. 剩余国家分组：按固定数量分块(Chunk)，避免单次查询 URL 过长导致 size=0。
+    3. 递归二分：对分组后的集合进行 Size Check。
     """
     job_data = context.job.context
     bot, chat_id, base_query = context.bot, job_data['chat_id'], job_data['query']
@@ -950,18 +950,13 @@ def run_sharded_download_job(context: CallbackContext):
     unique_results = set()
     stop_flag = f'stop_job_{chat_id}'
     
-    # 定义 Big N (数据量通常巨大的国家)
-    # CN=中国, US=美国, DE=德国, JP=日本, RU=俄罗斯
-    # GB=英国, FR=法国, NL=荷兰, CA=加拿大, KR=韩国
+    # 定义 Big N (数据量通常巨大的国家，单独处理)
     BIG_N = ['CN', 'US', 'DE', 'JP', 'RU', 'GB', 'FR', 'NL', 'CA', 'KR']
 
-    
-    # 发送初始消息
-    # 手动转义点号
+    # 发送初始消息 (已修复 Markdown 转义)
     msg = bot.send_message(chat_id, f"⏳ *启动递归二分分片下载*\n正在初始化策略引擎\.\.\.", parse_mode=ParseMode.MARKDOWN_V2)
 
-
-    # --- 内部类：状态汇报器 (处理 Telegram 编辑频率限制) ---
+    # --- 内部类：状态汇报器 ---
     class StatusReporter:
         def __init__(self, message_obj):
             self.msg = message_obj
@@ -973,8 +968,8 @@ def run_sharded_download_job(context: CallbackContext):
         def update(self, stage, force=False):
             self.current_stage = stage
             now = time.time()
-            # 限制更新频率：每 2.5 秒更新一次，或者强制更新
-            if force or (now - self.last_update_time > 2.5):
+            # 限制更新频率：每 3 秒更新一次，或者强制更新
+            if force or (now - self.last_update_time > 3):
                 try:
                     elapsed = int(now - self.start_time)
                     text = (
@@ -987,7 +982,7 @@ def run_sharded_download_job(context: CallbackContext):
                     self.msg.edit_text(text, parse_mode=ParseMode.MARKDOWN_V2)
                     self.last_update_time = now
                 except (BadRequest, RetryAfter, TimedOut):
-                    pass # 忽略网络波动或频率限制报错
+                    pass
 
     reporter = StatusReporter(msg)
 
@@ -1000,36 +995,34 @@ def run_sharded_download_job(context: CallbackContext):
 
     # --- 辅助函数：深度追溯下载 (针对单国 > 10k 的情况) ---
     def download_deep_trace(query_scope, country_code):
-        reporter.update(f"深度追溯: {country_code} (数据量过大)", force=True)
+        reporter.update(f"深度追溯: {country_code}", force=True)
         try:
             # 如果是 Guest Key，无法使用深度追溯，只能拿前 10k
             if guest_key:
-                d, _ = fetch_fofa_data(guest_key, query_scope, page=1, page_size=10000, fields="host")
+                d, _ = fetch_fofa_data(guest_key, query_scope, page=1, page_size=10000, fields="host", full_mode=False)
                 if d and d.get('results'):
                     res = [r[0] if isinstance(r, list) else r for r in d['results']]
-                    reporter.total_found += len(res)
                     return res
                 return []
 
-            # 正式追溯
             collected = []
             # 获取一个可用的 key 用于迭代器
             _, valid_key, _, _, _, _ = execute_query_with_fallback(lambda k,l,p: (True, None))
             
+            # 使用迭代器
             iterator = iter_fofa_traceback(valid_key, query_scope, limit=None, proxy_session=proxy_session)
             
             for batch in iterator:
                 if context.bot_data.get(stop_flag): break
                 valid_items = [item[0] for item in batch if item and isinstance(item, list) and len(item)>0]
                 
-                # 增量去重计数
                 new_count = 0
                 for item in valid_items:
-                    if item not in unique_results: # 注意：这里引用外部 unique_results 只是为了计数准确性，实际添加在外部
+                    if item not in unique_results:
                         new_count += 1
                 
                 collected.extend(valid_items)
-                reporter.total_found += new_count # 更新显示计数
+                reporter.total_found += new_count
                 reporter.update(f"深度追溯 {country_code}: 已抓取 {len(collected)} 条")
             
             return collected
@@ -1042,24 +1035,20 @@ def run_sharded_download_job(context: CallbackContext):
         if not countries: return
         if context.bot_data.get(stop_flag): return
 
-        # 构造组名用于显示
-        if len(countries) == 1:
-            group_desc = f"国家 {countries[0]}"
-        else:
-            group_desc = f"国家组 ({len(countries)}个, 如 {countries[0]}...)"
-
+        # 构造组名
+        group_desc = f"国家组({len(countries)}个)" if len(countries) > 1 else f"国家 {countries[0]}"
         reporter.update(f"侦察: {group_desc}")
 
         # 1. 构造查询
         country_condition = " || ".join([f'country="{c}"' for c in countries])
         group_query = f'({base_query}) && ({country_condition})'
         
-        # 2. 侦察 Size
+        # 2. 侦察 Size (强制关闭 full_mode，防止 F 点不足报错)
         if guest_key:
-            data_check, error = fetch_fofa_data(guest_key, group_query, page_size=1, fields="host")
+            data_check, error = fetch_fofa_data(guest_key, group_query, page_size=1, fields="host", full_mode=False)
         else:
             data_check, _, _, _, _, error = execute_query_with_fallback(
-                lambda k, l, ps: fetch_fofa_data(k, group_query, page_size=1, fields="host", proxy_session=ps),
+                lambda k, l, ps: fetch_fofa_data(k, group_query, page_size=1, fields="host", proxy_session=ps, full_mode=False),
                 proxy_session=proxy_session
             )
         
@@ -1069,86 +1058,82 @@ def run_sharded_download_job(context: CallbackContext):
             
         size = data_check.get('size', 0)
 
+        # 3. 决策分支
         if size == 0:
-            # 无数据，直接跳过
             return
 
-        # 3. 决策分支
         if size <= 10000:
             # --- 分支 A: 直接打包下载 ---
-            reporter.update(f"下载: {group_desc} (包含 {size} 条)")
+            reporter.update(f"下载: {group_desc} ({size}条)")
             
             if guest_key:
-                data, _ = fetch_fofa_data(guest_key, group_query, page=1, page_size=10000, fields="host")
+                data, _ = fetch_fofa_data(guest_key, group_query, page=1, page_size=10000, fields="host", full_mode=False)
             else:
                 data, _, _, _, _, _ = execute_query_with_fallback(
-                    lambda k, l, ps: fetch_fofa_data(k, group_query, page=1, page_size=10000, fields="host", proxy_session=ps),
+                    lambda k, l, ps: fetch_fofa_data(k, group_query, page=1, page_size=10000, fields="host", proxy_session=ps, full_mode=False),
                     proxy_session=proxy_session
                 )
             
             if data and data.get('results'):
                 new_res = [r[0] for r in data['results'] if isinstance(r, list)] if isinstance(data['results'][0], list) else data['results']
-                
-                # 计数并更新
                 added_count = 0
                 for r in new_res:
                     if isinstance(r, str) and ':' in r and r not in unique_results:
                         unique_results.add(r)
                         added_count += 1
-                
                 reporter.total_found += added_count
                 
         else:
-            # --- 分支 B: 数据量 > 10000，需要处理 ---
-            
-            # B1. 如果只剩 1 个国家，无法再分 -> 降级为深度追溯
+            # --- 分支 B: 数据量 > 10000 ---
             if len(countries) == 1:
+                # 单个国家超限 -> 深度追溯
                 target_country = countries[0]
                 traced_data = download_deep_trace(group_query, target_country)
-                
                 for r in traced_data:
                     if r not in unique_results:
                         unique_results.add(r)
                 return
 
-            # B2. 还有多个国家 -> 二分拆解 (Recursion)
-            reporter.update(f"拆分: {group_desc} 数据量({size}) > 10k, 正在二分...")
-            
+            # 多个国家 -> 二分拆解
+            reporter.update(f"拆分: {group_desc} > 10k, 二分中...")
             mid = len(countries) // 2
-            group_a = countries[:mid]
-            group_b = countries[mid:]
-            
-            process_country_group(group_a, depth=depth+1)
-            process_country_group(group_b, depth=depth+1)
-
+            process_country_group(countries[:mid], depth=depth+1)
+            process_country_group(countries[mid:], depth=depth+1)
 
     # --- 主流程开始 ---
 
-    # 1. 收集所有非 Big N 的国家代码
-    all_other_countries = []
-    for continent, countries in CONTINENT_COUNTRIES.items():
-        for c in countries:
-            if c not in BIG_N:
-                all_other_countries.append(c)
-    
-    # 去重并排序
-    all_other_countries = sorted(list(set(all_other_countries)))
-
-    # 2. 处理 Big N (单独优先处理)
+    # 1. 优先处理 Big N
     for i, big_c in enumerate(BIG_N):
         if context.bot_data.get(stop_flag): break
-        reporter.update(f"处理 Big 3: {big_c} ({i+1}/{len(BIG_N)})")
+        reporter.update(f"处理 Big N: {big_c} ({i+1}/{len(BIG_N)})")
         process_country_group([big_c])
 
-    # 3. 处理剩余世界 (作为一整个大组开始递归)
+    # 2. 处理剩余国家 (关键修改：分块处理)
     if not context.bot_data.get(stop_flag):
-        reporter.update(f"处理剩余世界: {len(all_other_countries)} 个国家")
-        process_country_group(all_other_countries)
+        # 收集剩余国家
+        remaining_countries = []
+        for continent, countries in CONTINENT_COUNTRIES.items():
+            for c in countries:
+                if c not in BIG_N:
+                    remaining_countries.append(c)
+        
+        # 去重并排序
+        remaining_countries = sorted(list(set(remaining_countries)))
+        
+        # 关键修复：将剩余国家切分成小块（每 20 个一组）进行处理
+        # 避免一次性构造几百个 OR 条件导致查询 URL 过长被截断或报错
+        CHUNK_SIZE = 20 
+        total_chunks = (len(remaining_countries) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        for i in range(0, len(remaining_countries), CHUNK_SIZE):
+            if context.bot_data.get(stop_flag): break
+            chunk = remaining_countries[i : i + CHUNK_SIZE]
+            current_chunk_idx = (i // CHUNK_SIZE) + 1
+            reporter.update(f"处理剩余分组: {current_chunk_idx}/{total_chunks}")
+            process_country_group(chunk)
 
     # --- 结果处理 ---
     context.bot_data.pop(stop_flag, None)
-    
-    # 最后强制更新一次状态
     reporter.update("任务完成，正在打包...", force=True)
     
     if unique_results:
