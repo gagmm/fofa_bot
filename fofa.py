@@ -178,6 +178,19 @@ def load_json_file(filename, default_content):
     except (json.JSONDecodeError, IOError):
         logger.error(f"{filename} 损坏，将使用默认配置重建。");
         with open(filename, 'w', encoding='utf-8') as f: json.dump(default_content, f, indent=4); return default_content
+        
+def find_cached_query(query_text):
+    """
+    在本地历史记录中查找是否存在完全匹配的查询缓存。
+    """
+    with HISTORY_LOCK:
+        for item in HISTORY.get('queries', []):
+            if item.get('query_text') == query_text:
+                # 检查文件是否存在，防止缓存记录还在但文件被删了
+                if item.get('cache') and os.path.exists(item['cache'].get('file_path', '')):
+                    return item
+    return None
+
 def save_json_file(filename, data, lock=None):
     """
     保存 JSON 文件，支持线程锁。
