@@ -657,8 +657,9 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
         
         # --- 故障转移逻辑 (Failover) ---
         error_str = str(error)
-        # 检测：[820031] F点不足 或 [45022] 请求次数达上限
-        if "[45022]" in error_str:
+        # 同时检测 45022(并发), 820031(F点不足), 820041(每日上限)
+        if "[45022]" in error_str or "[820031]" in error_str or "[820041]" in error_str:
+
             logger.warning(f"Key [#{key_num}] 额度耗尽 ({error_str})，自动切换下一个 Key...")
             continue # 跳过当前 Key，尝试下一个
             
@@ -2767,7 +2768,13 @@ def remove_api(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ 已成功移除以下 Key:\n{', '.join(reversed(removed_keys_display))}", parse_mode=ParseMode.MARKDOWN_V2)
     
-    fake_update = type('FakeUpdate', (), {'message': update.message, 'callback_query': None})
+    fake_update = type('FakeUpdate', (), {
+    'message': update.message, 
+    'callback_query': None,
+    'effective_user': update.effective_user, # <--- 添加这一行
+    'effective_chat': update.effective_chat  # <--- 建议也加上这个以防万一
+    })
+
     return settings_command(fake_update, context)
 def show_preset_menu(update: Update, context: CallbackContext):
     query = update.callback_query; presets = CONFIG.get("presets", [])
@@ -3608,7 +3615,9 @@ def main() -> None:
                 CallbackQueryHandler(show_backup_restore_menu, pattern=r"^settings_backup"),
                 CallbackQueryHandler(backup_config_command, pattern=r"^backup_now"),
                 # 直接传递函数，让装饰器接收完整的 Update 对象
+                # 直接传递函数，CallbackQueryHandler 会自动传递完整的 update 对象
                 CallbackQueryHandler(restore_config_command, pattern=r"^restore_now"),
+
 
                 CallbackQueryHandler(get_update_url, pattern=r"^update_set_url"),
                 CallbackQueryHandler(settings_command, pattern=r"^(update_back|backup_back)"),
