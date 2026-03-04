@@ -68,6 +68,11 @@ FOFA_HOST_BASE_URL = "https://fofa.info/api/v1/host/"
 PREVIEW_PAGE_SIZE = 10 # 预览功能每页条目
 TELEGRAM_MAX_FILE_SIZE_BYTES = 48 * 1024 * 1024
 
+# --- /preview 命令 (v10.9.8 优化版) ---
+
+PREVIEW_PAGE_SIZE = 10  # 每页条目数
+PREVIEW_FETCH_SIZE = 200  # 一次性从FOFA获取的最大条目数
+
 # --- 大洲国家代码 ---
 CONTINENT_COUNTRIES = {
     'Asia': ['AF', 'AM', 'AZ', 'BH', 'BD', 'BT', 'BN', 'KH', 'CN', 'CY', 'GE', 'IN', 'ID', 'IR', 'IQ', 'IL', 'JP', 'JO', 'KZ', 'KW', 'KG', 'LA', 'LB', 'MY', 'MV', 'MN', 'MM', 'NP', 'KP', 'OM', 'PK', 'PS', 'PH', 'QA', 'SA', 'SG', 'KR', 'LK', 'SY', 'TW', 'TJ', 'TH', 'TL', 'TR', 'TM', 'AE', 'UZ', 'VN', 'YE'],
@@ -3410,11 +3415,15 @@ def run_host_from_menu(update: Update, context: CallbackContext):
 
 
 # --- /preview 命令 (v10.9.7) ---
+
+
 def _build_preview_message(context: CallbackContext, page: int):
-    """构建预览消息文本和按钮。"""
+    """构建预览消息文本和按钮，支持 HTTP 头切换。"""
     results = context.user_data.get('preview_results', [])
     total_pages = context.user_data.get('preview_total_pages', 0)
     query_text = context.user_data.get('preview_query', 'N/A')
+    total_results = len(results)
+    add_http = context.user_data.get('preview_add_http', False)
 
     if not results:
         return "没有可供预览的结果。", None
@@ -3422,38 +3431,136 @@ def _build_preview_message(context: CallbackContext, page: int):
     start_index = (page - 1) * PREVIEW_PAGE_SIZE
     end_index = start_index + PREVIEW_PAGE_SIZE
     page_results = results[start_index:end_index]
-    
-    # [ip, port, title]
-    message_parts = [f"📄 *预览: `{escape_markdown_v2(query_text)}`* \\(第 {page}/{total_pages} 页\\)\n"]
-    for item in page_results:
-        ip, port, title = item[0], item[1], item[2]
-        title_str = escape_markdown_v2(title.strip()) if title else "_无标题_"
-        # 修改点：将 - 修改为 \-
-        message_parts.append(f"`{escape_markdown_v2(ip)}:{port}` \\- {title_str}")
-    
+
+    # 构建标题行
+    http_status = "🟢 已开启" if add_http else "🔴 已关闭"
+    message_parts = [
+        f"📄 *预览: `{escape_markdown_v2(query_text)}`*",
+        f"共 *{total_results}* 条 \\| 第 {page}/{total_pages} 页 \\| HTTP头: {http_status}\n"
+    ]
+
+    for idx, item in enumerate(page_results):
+        # item 格式: [ip, port, protocol, title, host]
+        ip = item[0] if len(item) > 0 else 'N/A'
+        port = item[1] if len(item) > 1 else ''
+        protocol = item[2] if len(item) > 2 else ''
+        title = item[3] if len(item) > 3 else ''
+        host = item[4] if len(item) > 4 else ''
+
+        title_str = escape_markdown_v2(title.strip()) if title and title.strip() else "_无标题_"
+        line_num = start_index + idx + 1
+
+        # 构建可点击链接
+        if add_http:
+            # 智能拼接URL：如果host本身已经带http就用host，否则根据protocol/port推断
+            if host and (host.startswith('http://') or host.startswith('https://')):
+                clickable_url = host
+            elif protocol and protocol.lower() in ('https', 'tls', 'ssl'):
+                clickable_url = f"https://{ip}:{port}"
+            elif port in ('443', '8443'):
+                clickable_url = f"https://{ip}:{port}"
+            else:
+                clickable_url = f"http://{ip}:{port}"
+
+            escaped_url = escape_markdown_v2(clickable_url)
+            message_parts.append(
+                f"`{line_num}\\.` [{escape_markdown_v2(ip)}:{port}]({escaped_url})"
+                f"\n   📌 {title_str}"
+            )
+        else:
+            message_parts.append(
+                f"`{line_num}\\.` `{escape_markdown_v2(ip)}:{port}` \\({escape_markdown_v2(protocol or 'N/A')}\\)"
+                f"\n   📌 {title_str}"
+            )
+
     message = "\n".join(message_parts)
 
-    keyboard_row = []
+    # 构建按钮
+    keyboard = []
+
+    # 翻页行
+    nav_row = []
     if page > 1:
-        keyboard_row.append(InlineKeyboardButton("⬅️ 上一页", callback_data="preview_prev"))
-    keyboard_row.append(InlineKeyboardButton("❌ 关闭", callback_data="preview_close"))
+        nav_row.append(InlineKeyboardButton("⬅️ 上一页", callback_data="preview_prev"))
+    nav_row.append(InlineKeyboardButton(f"📖 {page}/{total_pages}", callback_data="preview_noop"))
     if page < total_pages:
-        keyboard_row.append(InlineKeyboardButton("下一页 ➡️", callback_data="preview_next"))
-    
-    return message, InlineKeyboardMarkup([keyboard_row])
+        nav_row.append(InlineKeyboardButton("下一页 ➡️", callback_data="preview_next"))
+    keyboard.append(nav_row)
+
+    # 快捷跳页行（当页数较多时显示）
+    if total_pages > 5:
+        jump_row = []
+        if page > 2:
+            jump_row.append(InlineKeyboardButton("⏮ 首页", callback_data="preview_first"))
+        # 显示附近页码
+        nearby_pages = set()
+        for p in range(max(1, page - 2), min(total_pages + 1, page + 3)):
+            if p != page:
+                nearby_pages.add(p)
+        for p in sorted(nearby_pages)[:4]:
+            jump_row.append(InlineKeyboardButton(f"📄 {p}", callback_data=f"preview_goto_{p}"))
+        if page < total_pages - 1:
+            jump_row.append(InlineKeyboardButton("⏭ 末页", callback_data="preview_last"))
+        if jump_row:
+            keyboard.append(jump_row)
+
+    # 功能行
+    http_toggle_text = "🔗 关闭HTTP头" if add_http else "🔗 开启HTTP头"
+    func_row = [
+        InlineKeyboardButton(http_toggle_text, callback_data="preview_toggle_http"),
+        InlineKeyboardButton("📋 复制本页", callback_data="preview_copy"),
+        InlineKeyboardButton("❌ 关闭", callback_data="preview_close"),
+    ]
+    keyboard.append(func_row)
+
+    return message, InlineKeyboardMarkup(keyboard)
+
 
 def preview_command(update: Update, context: CallbackContext) -> int:
-    """/preview 和 /p 命令的入口点。"""
+    """/preview 和 /p 命令的入口点，支持自定义数量。"""
     if not context.args:
-        update.message.reply_text("用法: `/preview <FOFA 查询语句>`\n此命令用于快速预览少量数据。", parse_mode=ParseMode.MARKDOWN_V2)
+        update.message.reply_text(
+            "📄 *快速预览命令*\n\n"
+            "用法: `/preview <FOFA 查询语句>`\n"
+            "或: `/preview <数量> <FOFA 查询语句>`\n\n"
+            "示例:\n"
+            '`/preview domain="example.com"`\n'
+            '`/preview 100 domain="example.com"`\n\n'
+            f"默认获取 {PREVIEW_FETCH_SIZE} 条，最大支持 {PREVIEW_FETCH_SIZE} 条。\n"
+            "支持翻页浏览、开启HTTP头可点击访问。",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
         return ConversationHandler.END
-        
-    query_text = " ".join(context.args)
-    msg = update.message.reply_text("⏳ 正在获取预览数据...")
 
+    # 解析参数：检查第一个参数是否为数字（自定义数量）
+    fetch_size = PREVIEW_FETCH_SIZE
+    query_parts = context.args
+
+    if query_parts[0].isdigit():
+        custom_size = int(query_parts[0])
+        if custom_size < 1:
+            custom_size = 1
+        if custom_size > PREVIEW_FETCH_SIZE:
+            custom_size = PREVIEW_FETCH_SIZE
+        fetch_size = custom_size
+        query_parts = query_parts[1:]
+
+    if not query_parts:
+        update.message.reply_text("❌ 请在数量后面提供 FOFA 查询语句。")
+        return ConversationHandler.END
+
+    query_text = " ".join(query_parts)
+    msg = update.message.reply_text(f"⏳ 正在获取预览数据 \\(最多 {fetch_size} 条\\)\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+
+    # 请求字段: ip, port, protocol, title, host
     def query_logic(key, key_level, proxy_session):
-        # 请求50条数据，字段为 ip, port, title
-        return fetch_fofa_data(key, query_text, page=1, page_size=50, fields="ip,port,title", proxy_session=proxy_session)
+        return fetch_fofa_data(
+            key, query_text,
+            page=1,
+            page_size=fetch_size,
+            fields="ip,port,protocol,title,host",
+            proxy_session=proxy_session
+        )
 
     data, _, _, _, _, error = execute_query_with_fallback(query_logic, min_level=0)
 
@@ -3462,66 +3569,189 @@ def preview_command(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
 
     results = data.get('results', [])
+    total_api_size = data.get('size', 0)
+
     if not results:
         msg.edit_text("🤷‍♀️ 未找到任何结果。")
         return ConversationHandler.END
 
+    # 初始化用户数据
     context.user_data['preview_results'] = results
     context.user_data['preview_query'] = query_text
     context.user_data['preview_page'] = 1
-    total_pages = (len(results) - 1) // PREVIEW_PAGE_SIZE + 1
+    context.user_data['preview_add_http'] = False
+    context.user_data['preview_total_api_size'] = total_api_size
+
+    total_pages = max(1, (len(results) - 1) // PREVIEW_PAGE_SIZE + 1)
     context.user_data['preview_total_pages'] = total_pages
 
     message_text, reply_markup = _build_preview_message(context, page=1)
-    
-    msg.edit_text(
-        message_text,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
+
+    # 如果FOFA总数远大于获取数，添加提示
+    if total_api_size > len(results):
+        extra_note = f"\n\n💡 _FOFA共有 {total_api_size} 条结果，当前仅预览前 {len(results)} 条。如需更多请使用 `/kkfofa` 或 `/allfofa`。_"
+        # 需要对额外注释也做markdown转义
+        extra_note_escaped = (
+            f"\n\n💡 _FOFA共有 {total_api_size} 条结果，当前仅预览前 {len(results)} 条。"
+            f"如需更多请使用 `/kkfofa` 或 `/allfofa`。_"
+        )
+        message_text += extra_note_escaped
+
+    try:
+        msg.edit_text(
+            message_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True
+        )
+    except BadRequest as e:
+        # 如果消息过长，截断重试
+        if "message is too long" in str(e).lower():
+            context.user_data['preview_results'] = results[:50]
+            total_pages = max(1, (min(len(results), 50) - 1) // PREVIEW_PAGE_SIZE + 1)
+            context.user_data['preview_total_pages'] = total_pages
+            message_text, reply_markup = _build_preview_message(context, page=1)
+            msg.edit_text(
+                message_text + "\n\n⚠️ _结果已截断以适应消息长度限制_",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True
+            )
+        else:
+            msg.edit_text(f"❌ 渲染预览时出错: {escape_markdown_v2(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+            return ConversationHandler.END
 
     return PREVIEW_STATE_PAGINATE
 
+
 def preview_page_callback(update: Update, context: CallbackContext):
-    """处理预览翻页按钮。"""
+    """处理预览的所有按钮交互：翻页、跳页、HTTP头切换、复制。"""
     query = update.callback_query
-    query.answer()
-    
-    action = query.data.split('_')[1]
-    
-    current_page = context.user_data.get('preview_page', 1)
-    
-    if action == "close":
-        query.message.edit_text("预览已关闭。")
-        context.user_data.clear()
-        return ConversationHandler.END
-        
-    elif action == "next":
-        new_page = current_page + 1
-    elif action == "prev":
-        new_page = current_page - 1
-    else:
+
+    action_data = query.data
+    # 解析动作
+    if action_data == "preview_noop":
+        query.answer(f"当前第 {context.user_data.get('preview_page', 1)} 页")
         return PREVIEW_STATE_PAGINATE
-        
-    total_pages = context.user_data.get('preview_total_pages', 0)
+
+    query.answer()
+
+    current_page = context.user_data.get('preview_page', 1)
+    total_pages = context.user_data.get('preview_total_pages', 1)
+
+    # --- 关闭 ---
+    if action_data == "preview_close":
+        query.message.edit_text("✅ 预览已关闭。")
+        # 清理预览相关数据
+        for key in list(context.user_data.keys()):
+            if key.startswith('preview_'):
+                del context.user_data[key]
+        return ConversationHandler.END
+
+    # --- HTTP 头切换 ---
+    elif action_data == "preview_toggle_http":
+        current_status = context.user_data.get('preview_add_http', False)
+        context.user_data['preview_add_http'] = not current_status
+        new_status = "已开启 🟢" if not current_status else "已关闭 🔴"
+        # 无需更换页码，直接重新渲染当前页
+        message_text, reply_markup = _build_preview_message(context, page=current_page)
+        try:
+            query.edit_message_text(
+                message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                logger.error(f"编辑预览消息时出错: {e}")
+        return PREVIEW_STATE_PAGINATE
+
+    # --- 复制本页内容 ---
+    elif action_data == "preview_copy":
+        results = context.user_data.get('preview_results', [])
+        add_http = context.user_data.get('preview_add_http', False)
+        start_index = (current_page - 1) * PREVIEW_PAGE_SIZE
+        end_index = start_index + PREVIEW_PAGE_SIZE
+        page_results = results[start_index:end_index]
+
+        copy_lines = []
+        for item in page_results:
+            ip = item[0] if len(item) > 0 else ''
+            port = item[1] if len(item) > 1 else ''
+            protocol = item[2] if len(item) > 2 else ''
+            host = item[4] if len(item) > 4 else ''
+
+            if add_http:
+                if host and (host.startswith('http://') or host.startswith('https://')):
+                    copy_lines.append(host)
+                elif protocol and protocol.lower() in ('https', 'tls', 'ssl'):
+                    copy_lines.append(f"https://{ip}:{port}")
+                elif port in ('443', '8443'):
+                    copy_lines.append(f"https://{ip}:{port}")
+                else:
+                    copy_lines.append(f"http://{ip}:{port}")
+            else:
+                copy_lines.append(f"{ip}:{port}")
+
+        copy_text = "\n".join(copy_lines)
+
+        # 发送一条新的纯文本消息，方便用户复制
+        try:
+            context.bot.send_message(
+                update.effective_chat.id,
+                f"📋 第 {current_page} 页数据 (共 {len(copy_lines)} 条):\n\n```\n{copy_text}\n```",
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+        except Exception as e:
+            logger.error(f"发送复制内容失败: {e}")
+            context.bot.send_message(
+                update.effective_chat.id,
+                f"📋 第 {current_page} 页数据:\n\n{copy_text}"
+            )
+        return PREVIEW_STATE_PAGINATE
+
+    # --- 翻页逻辑 ---
+    new_page = current_page
+
+    if action_data == "preview_next":
+        new_page = current_page + 1
+    elif action_data == "preview_prev":
+        new_page = current_page - 1
+    elif action_data == "preview_first":
+        new_page = 1
+    elif action_data == "preview_last":
+        new_page = total_pages
+    elif action_data.startswith("preview_goto_"):
+        try:
+            new_page = int(action_data.split("_")[2])
+        except (ValueError, IndexError):
+            return PREVIEW_STATE_PAGINATE
+
+    # 边界检查
     if not 1 <= new_page <= total_pages:
         return PREVIEW_STATE_PAGINATE
 
+    # 避免无意义的重复编辑
+    if new_page == current_page and action_data not in ("preview_toggle_http",):
+        return PREVIEW_STATE_PAGINATE
+
     context.user_data['preview_page'] = new_page
-    
     message_text, reply_markup = _build_preview_message(context, page=new_page)
-    
+
     try:
         query.edit_message_text(
             message_text,
             reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN_V2
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True
         )
     except BadRequest as e:
         if "Message is not modified" not in str(e):
             logger.error(f"编辑预览消息时出错: {e}")
 
     return PREVIEW_STATE_PAGINATE
+
 
 # --- 主函数与调度器 ---
 def interactive_setup():
