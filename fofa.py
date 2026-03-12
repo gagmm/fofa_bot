@@ -6,6 +6,7 @@ import base64
 import time
 import re
 import requests
+import httpx
 import signal
 import socket
 import hashlib
@@ -23,6 +24,8 @@ from datetime import datetime, timedelta
 from dateutil import tz
 from urllib.parse import urlparse
 import uuid # 确保文件顶部有这行
+import resource
+import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ParseMode, ReplyKeyboardMarkup, KeyboardButton, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     Updater,
@@ -44,10 +47,27 @@ DATA_LOCK = threading.Lock() # <--- 添加这一行
 
 
 # --- 全局变量和常量 ---
-API_SESSION = requests.Session()
-API_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=3)
-API_SESSION.mount('http://', API_ADAPTER)
-API_SESSION.mount('https://', API_ADAPTER)
+# 全局共享的异步 HTTP 客户端
+# limits 参数直接控制连接池大小，彻底解决 FD 泄漏
+_HTTPX_LIMITS = httpx.Limits(
+    max_connections=50,        # 全局最大并发连接数
+    max_keepalive_connections=20,  # 保持活跃的连接数（复用）
+    keepalive_expiry=30.0      # 空闲连接超时关闭（秒）
+)
+
+_HTTPX_TIMEOUT = httpx.Timeout(
+    connect=10.0,   # 建立连接超时
+    read=60.0,      # 读取响应超时
+    write=10.0,     # 发送请求超时
+    pool=5.0        # 从连接池获取连接的等待超时
+)
+
+# 客户端在事件循环内懒加载，避免跨线程使用同一客户端实例
+_async_client: httpx.AsyncClient | None = None
+
+_thread_local = threading.local()
+
+
 CONFIG_FILE = 'config.json'
 HISTORY_FILE = 'history.json'
 LOG_FILE = 'fofa_bot.log'
@@ -168,7 +188,17 @@ STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
 # /preview 预览功能
 PREVIEW_STATE_PAGINATE = 110
 
-
+def _get_async_client() -> httpx.AsyncClient:
+    """获取当前线程的异步HTTP客户端（线程局部存储）。"""
+    if not hasattr(_thread_local, 'client') or _thread_local.client is None or _thread_local.client.is_closed:
+        _thread_local.client = httpx.AsyncClient(
+            limits=_HTTPX_LIMITS,
+            timeout=_HTTPX_TIMEOUT,
+            verify=False,
+            follow_redirects=True,
+            http2=False
+        )
+    return _thread_local.client
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -261,11 +291,10 @@ def generate_filename_from_query(query_text: str, prefix: str = "fofa", ext: str
     max_len = 100
     if len(sanitized_query) > max_len: sanitized_query = sanitized_query[:max_len].rsplit('_', 1)[0]
     timestamp = int(time.time()); return f"{prefix}_{sanitized_query}_{timestamp}{ext}"
-def get_proxies(proxy_to_use=None):
+def get_proxies(proxy_to_use=None) -> str | None:
     """
-    返回一个代理配置字典。
-    如果提供了 proxy_to_use，则专门使用它。
-    否则，从代理池中随机选择一个。
+    返回代理 URL 字符串（httpx 格式）。
+    原函数返回 dict，新函数返回 str | None。
     """
     proxy_str = proxy_to_use
     if proxy_str is None:
@@ -273,11 +302,9 @@ def get_proxies(proxy_to_use=None):
         if proxies_list:
             proxy_str = random.choice(proxies_list)
         else:
-            proxy_str = CONFIG.get("proxy")
-    
-    if proxy_str:
-        return {"http": proxy_str, "https": proxy_str}
-    return None
+            proxy_str = CONFIG.get("proxy") or None
+    return proxy_str if proxy_str else None
+
 def is_admin(user_id: int) -> bool: return user_id in CONFIG.get('admins', [])
 def is_super_admin(user_id: int) -> bool:
     admins = CONFIG.get('admins', [])
@@ -420,7 +447,9 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
         with open(file_path, 'rb') as f:
             files = {'file': (os.path.basename(file_path), f)}
             headers = {'Authorization': api_token}
-            response = requests.post(api_url, headers=headers, files=files, timeout=60, proxies=get_proxies())
+            proxy_str = get_proxies()
+            proxies_dict = {"http": proxy_str, "https": proxy_str} if proxy_str else None
+            response = requests.post(api_url, headers=headers, files=files, timeout=60, proxies=proxies_dict)
             response.raise_for_status()
             result = response.json()
         if result and isinstance(result, list) and 'src' in result[0]:
@@ -441,55 +470,115 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
         logger.error(f"文件上传失败: {e}")
         context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
 
-# --- FOFA API 核心逻辑 ---
-def _make_api_request(url, params, timeout=60, use_b64=True, retries=10, proxy_session=None):
-    if use_b64 and 'q' in params:
-        params['qbase64'] = base64.b64encode(params.pop('q').encode('utf-8')).decode('utf-8')
-    
-    last_error = None
-    # v10.9.4 FIX: 为整个重试循环确定代理。
-    # 如果传递了特定的会话，则使用它。否则，为此尝试获取一个随机的。
-    request_proxies = get_proxies(proxy_to_use=proxy_session)
-
-    for attempt in range(retries):
+def _run_async_api_call(coro):
+    """
+    为每次同步API调用创建隔离的事件循环。
+    避免全局客户端跨循环导致的RuntimeError。
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
         try:
-            response = API_SESSION.get(url, params=params, timeout=timeout, proxies=request_proxies, verify=False)
-            if response.status_code == 429:
-                wait_time = 5 * (attempt + 1)
-                logger.warning(f"FOFA API rate limit hit (429). Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
-                time.sleep(wait_time)
-                last_error = f"API请求因速率限制(429)失败"
-                continue
-            if response.status_code == 502: # Bad Gateway
-                wait_time = 5 * (attempt + 1)
-                logger.warning(f"FOFA API returned 502 Bad Gateway. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{retries})")
-                time.sleep(wait_time)
-                last_error = "API请求失败 (502 Bad Gateway)"
-                continue
-            response.raise_for_status()
-            data = response.json()
-            if data.get("error"):
-                return None, data.get("errmsg", "未知的FOFA错误")
-            return data, None
-        except requests.exceptions.RequestException as e:
-            last_error = f"网络请求失败: {e}"
-            wait_time = 5 * (attempt + 1) # 指数退避
-            logger.error(f"RequestException on attempt {attempt + 1}, retrying in {wait_time}s: {e}")
-            time.sleep(wait_time)
-        except json.JSONDecodeError as e:
-            last_error = f"解析JSON响应失败: {e}"
-            break
-    logger.error(f"API request failed after {retries} retries. Last error: {last_error}")
-    return None, last_error if last_error else "API请求未知错误"
+            # 清理loop内所有pending tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        finally:
+            loop.close()
+
+
+# --- FOFA API 核心逻辑 ---
+async def _make_api_request_async(
+    url: str,
+    params: dict,
+    timeout: float = 60,
+    use_b64: bool = True,
+    retries: int = 10,
+    proxy_url: str | None = None
+) -> tuple[dict | None, str | None]:
+    if use_b64 and 'q' in params:
+        params['qbase64'] = base64.b64encode(
+            params.pop('q').encode('utf-8')
+        ).decode('utf-8')
+
+    last_error = None
+
+    # 根据是否有代理决定使用全局客户端还是临时客户端
+    if proxy_url:
+        client_ctx = httpx.AsyncClient(
+            proxies=proxy_url,
+            limits=_HTTPX_LIMITS,
+            timeout=_HTTPX_TIMEOUT,
+            verify=False,
+            follow_redirects=True,
+        )
+    else:
+        # 使用全局单例（无需with语句管理生命周期）
+        client_ctx = None
+
+    async def _do_requests(client):
+        nonlocal last_error
+        for attempt in range(retries):
+            try:
+                response = await client.get(url, params=params, timeout=timeout)
+
+                if response.status_code == 429:
+                    wait_time = 5 * (attempt + 1)
+                    logger.warning(f"FOFA API rate limit (429). Retrying in {wait_time}s ({attempt+1}/{retries})")
+                    await asyncio.sleep(wait_time)
+                    last_error = "API请求因速率限制(429)失败"
+                    continue
+
+                if response.status_code == 502:
+                    wait_time = 5 * (attempt + 1)
+                    logger.warning(f"FOFA API 502. Retrying in {wait_time}s ({attempt+1}/{retries})")
+                    await asyncio.sleep(wait_time)
+                    last_error = "API请求失败 (502 Bad Gateway)"
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+                if data.get("error"):
+                    return None, data.get("errmsg", "未知的FOFA错误")
+                return data, None
+
+            except httpx.TimeoutException as e:
+                last_error = f"请求超时: {e}"
+                await asyncio.sleep(5 * (attempt + 1))
+            except httpx.RequestError as e:
+                last_error = f"网络请求失败: {e}"
+                await asyncio.sleep(5 * (attempt + 1))
+            except Exception as e:
+                last_error = f"解析响应失败: {e}"
+                logger.error(f"Unexpected error: {e}", exc_info=True)
+                break
+
+        return None, last_error or "API请求未知错误"
+
+    if client_ctx:
+        async with client_ctx as client:
+            return await _do_requests(client)
+    else:
+        return await _do_requests(_get_async_client())
+
+
 def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
 def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None, full_mode=None):
-    # 逻辑：优先使用传入的 full_mode，否则读取配置
+    """从FOFA API获取搜索数据。"""
     use_full = full_mode if full_mode is not None else CONFIG.get("full_mode", False)
-    # ...
-    
-    # 转换为小写字符串 'true'/'false'，确保 API 识别正确
-    params = {'key': key, 'q': query, 'size': page_size, 'page': page, 'fields': fields, 'full': str(use_full).lower()}
+    params = {
+        'key': key,
+        'q': query,
+        'size': page_size,
+        'page': page,
+        'fields': fields,
+        'full': str(use_full).lower()
+    }
     return _make_api_request(FOFA_SEARCH_URL, params, proxy_session=proxy_session)
+
 
 def fetch_fofa_stats(key, query, proxy_session=None):
     params = {'key': key, 'q': query, 'fields': FOFA_STATS_FIELDS}
@@ -503,6 +592,29 @@ def fetch_fofa_next_data(key, query, next_id=None, page_size=10000, fields="host
     # FIX: Ensure 'next' parameter is always present, and empty on the first call, to comply with API spec.
     params['next'] = next_id if next_id is not None else ""
     return _make_api_request(FOFA_NEXT_URL, params, proxy_session=proxy_session)
+
+def _make_api_request(
+    url: str,
+    params: dict,
+    timeout: float = 60,
+    use_b64: bool = True,
+    retries: int = 10,
+    proxy_session: str | None = None
+) -> tuple[dict | None, str | None]:
+    """
+    同步兼容层：将异步请求包装为同步调用。
+    函数签名与原版完全一致，业务代码零修改。
+    """
+    return _run_async_api_call(
+        _make_api_request_async(
+            url=url,
+            params=params,
+            timeout=timeout,
+            use_b64=use_b64,
+            retries=retries,
+            proxy_url=proxy_session
+        )
+    )
 
 # --- 智能下载核心工具 ---
 def iter_fofa_traceback(key, query, limit=None, proxy_session=None, page_size=10000):
@@ -673,14 +785,26 @@ def execute_query_with_fallback(query_func, preferred_key_index=None, proxy_sess
         
     return None, None, None, None, None, "所有可用 Key 均已尝试，额度全部耗尽，明天再来使用该bot。"
 # --- 异步扫描逻辑 ---
-async def async_check_port(host, port, timeout):
+async def async_check_port(host: str, port: int, timeout: float) -> str | None:
+    writer = None
     try:
-        fut = asyncio.open_connection(host, port)
-        _, writer = await asyncio.wait_for(fut, timeout=timeout)
-        writer.close(); await writer.wait_closed()
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout
+        )
         return f"{host}:{port}"
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError, socket.gaierror): return None
-    except Exception: return None
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError, socket.gaierror):
+        return None
+    except Exception:
+        return None
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
 
 async def async_scanner_orchestrator(scan_targets, concurrency, timeout, progress_callback=None):
     semaphore = asyncio.Semaphore(concurrency)
@@ -1054,9 +1178,9 @@ def run_sharded_download_job(context: CallbackContext):
         if guest_key:
             data_check, error = fetch_fofa_data(guest_key, group_query, page_size=1, fields="host", full_mode=False)
         else:
+            _q = group_query
             data_check, _, _, _, _, error = execute_query_with_fallback(
-                lambda k, l, ps: fetch_fofa_data(k, group_query, page_size=1, fields="host", proxy_session=ps, full_mode=False),
-                proxy_session=proxy_session
+                lambda k, l, ps, q=_q: fetch_fofa_data(k, q, page_size=1, fields="host", proxy_session=ps, full_mode=False)
             )
         
         if error:
@@ -1076,8 +1200,9 @@ def run_sharded_download_job(context: CallbackContext):
             if guest_key:
                 data, _ = fetch_fofa_data(guest_key, group_query, page=1, page_size=10000, fields="host", full_mode=False)
             else:
+                _q = group_query
                 data, _, _, _, _, _ = execute_query_with_fallback(
-                    lambda k, l, ps: fetch_fofa_data(k, group_query, page=1, page_size=10000, fields="host", proxy_session=ps, full_mode=False),
+                    lambda k, l, ps, q=_q: fetch_fofa_data(k, q, page=1, page_size=10000, fields="host", proxy_session=ps, full_mode=False),
                     proxy_session=proxy_session
                 )
             
@@ -1224,7 +1349,6 @@ def run_traceback_download_query(context: CallbackContext):
 
     # 锁定一个代理 session
     proxy_session = get_proxies() 
-    if proxy_session: proxy_session = proxy_session.get('http') # 简化处理，复用现有逻辑
 
     while True: # 主循环：每一页
         page_count += 1
@@ -1817,7 +1941,7 @@ def start_new_kkfofa_search(update: Update, context: CallbackContext, message_to
         ),
         preferred_key_index=key_index
     )
-        used_key_info = f"Key \\[\\#{used_key_index}\\]"
+    used_key_info = f"Key \\[\\#{used_key_index}\\]"
     if error: msg.edit_text(f"❌ 查询出错: {error}"); return ConversationHandler.END
     
     total_size = data.get('size', 0)
@@ -2714,23 +2838,27 @@ def get_key(update: Update, context: CallbackContext):
     new_key = update.message.text.strip()
     if new_key in CONFIG['apis']:
         update.message.reply_text("⚠️ 此 Key 已存在。")
-        return settings_command(update, context)
+    else:
+        msg = update.message.reply_text("⏳ 正在验证新的 API Key...")
+        data, error = verify_fofa_api(new_key)
+        if error:
+            msg.edit_text(f"❌ Key 验证失败: {error}\n请重新输入一个有效的Key，或使用 /cancel 取消。")
+            return SETTINGS_STATE_GET_KEY
+        CONFIG['apis'].append(new_key)
+        save_config()
+        check_and_classify_keys()
+        msg.edit_text(f"✅ API Key ({data.get('username', 'N/A')}) 已成功添加。")
 
-    msg = update.message.reply_text("⏳ 正在验证新的 API Key...")
-    data, error = verify_fofa_api(new_key)
-    if error:
-        msg.edit_text(f"❌ Key 验证失败: {error}\n请重新输入一个有效的Key，或使用 /cancel 取消。")
-        return SETTINGS_STATE_GET_KEY  
-    
-    CONFIG['apis'].append(new_key)
-    save_config()
-    check_and_classify_keys() 
-    msg.edit_text(f"✅ API Key ({data.get('username', 'N/A')}) 已成功添加。")
-    
-    # 使用一个新的 update 对象来调用 settings_command，因为它需要一个有效的 update 对象
-    # 来发送新消息，而我们编辑了旧消息。
-    fake_update = type('FakeUpdate', (), {'message': update.message, 'callback_query': None})
-    return settings_command(fake_update, context)
+    # 修复：直接发送新的设置菜单，而不构造fake_update
+    keyboard = [
+        [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api'), InlineKeyboardButton("✨ 预设管理", callback_data='settings_preset')],
+        [InlineKeyboardButton("🌐 代理池管理", callback_data='settings_proxypool'), InlineKeyboardButton("📡 监控设置", callback_data='settings_monitor')],
+        [InlineKeyboardButton("📤 上传接口设置", callback_data='settings_upload'), InlineKeyboardButton("👨‍💼 管理员设置", callback_data='settings_admin')],
+        [InlineKeyboardButton("💾 备份与恢复", callback_data='settings_backup'), InlineKeyboardButton("🔄 脚本更新", callback_data='settings_update')],
+        [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
+    ]
+    update.message.reply_text("⚙️ *设置菜单*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+    return SETTINGS_STATE_MAIN
 
 def remove_api(update: Update, context: CallbackContext):
     input_text = update.message.text.strip()
@@ -2773,12 +2901,16 @@ def remove_api(update: Update, context: CallbackContext):
     
     update.message.reply_text(f"✅ 已成功移除以下 Key:\n{', '.join(reversed(removed_keys_display))}", parse_mode=ParseMode.MARKDOWN_V2)
     
-    fake_update = type('FakeUpdate', (), {
-    'message': update.message, 
-    'callback_query': None,
-    'effective_user': update.effective_user, # <--- 添加这一行
-    'effective_chat': update.effective_chat  # <--- 建议也加上这个以防万一
-    })
+    keyboard = [
+        [InlineKeyboardButton("🔑 API 管理", callback_data='settings_api'), InlineKeyboardButton("✨ 预设管理", callback_data='settings_preset')],
+        [InlineKeyboardButton("🌐 代理池管理", callback_data='settings_proxypool'), InlineKeyboardButton("📡 监控设置", callback_data='settings_monitor')],
+        [InlineKeyboardButton("📤 上传接口设置", callback_data='settings_upload'), InlineKeyboardButton("👨‍💼 管理员设置", callback_data='settings_admin')],
+        [InlineKeyboardButton("💾 备份与恢复", callback_data='settings_backup'), InlineKeyboardButton("🔄 脚本更新", callback_data='settings_update')],
+        [InlineKeyboardButton("❌ 关闭菜单", callback_data='settings_close')]
+    ]
+    update.message.reply_text("⚙️ *设置菜单*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
+    return SETTINGS_STATE_MAIN
+
 
     return settings_command(fake_update, context)
 def show_preset_menu(update: Update, context: CallbackContext):
@@ -3790,6 +3922,14 @@ def interactive_setup():
     return True
 
 def main() -> None:
+    # --- FD 限制提升 ---
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(65536, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        logger.info(f"文件描述符限制已提升: {soft} -> {target} (hard: {hard})")
+    except (ValueError, resource.error) as e:
+        logger.warning(f"无法提升 FD 限制（需要 root 或修改 /etc/security/limits.conf）: {e}")
     os.makedirs(FOFA_CACHE_DIR, exist_ok=True)
 
     if not os.path.exists(CONFIG_FILE) or CONFIG.get("bot_token") == "YOUR_BOT_TOKEN_HERE":
@@ -3936,6 +4076,16 @@ def main() -> None:
     logger.info(f"🚀 Fofa Bot v10.9 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
+
+    # === 新增：优雅关闭异步客户端 ===
+    global _async_client
+    if _async_client and not _async_client.is_closed:
+        try:
+            asyncio.run(_async_client.aclose())
+            logger.info("httpx AsyncClient 已关闭。")
+        except Exception as e:
+            logger.warning(f"关闭 httpx 客户端时出错: {e}")
+
     logger.info("Bot has been shut down gracefully.")
 
 if __name__ == "__main__":
