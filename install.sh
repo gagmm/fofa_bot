@@ -12,7 +12,7 @@ INSTALL_DIR="/opt/fofa_bot"
 SCRIPT_NAME="fofa.py"
 SERVICE_NAME="fofa_bot"
 # Python 依赖包 (去除引号，pip 本身可以直接解析)
-TARGET_PACKAGES="requests pandas python-dateutil python-telegram-bot==13.15"
+TARGET_PACKAGES="requests pandas python-dateutil python-telegram-bot==13.15" httpx
 
 # =================日志与核心功能函数=================
 log_info() { echo -e "${GREEN}[INFO] $1${PLAIN}"; }
