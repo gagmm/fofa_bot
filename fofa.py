@@ -62,8 +62,6 @@ _HTTPX_TIMEOUT = httpx.Timeout(
     pool=5.0        # 从连接池获取连接的等待超时
 )
 
-# 客户端在事件循环内懒加载，避免跨线程使用同一客户端实例
-_async_client: httpx.AsyncClient | None = None
 
 _thread_local = threading.local()
 
@@ -187,18 +185,6 @@ STATE_AWAITING_QUERY, STATE_AWAITING_HOST = range(1, 3)
 
 # /preview 预览功能
 PREVIEW_STATE_PAGINATE = 110
-
-def _get_async_client() -> httpx.AsyncClient:
-    """获取当前线程的异步HTTP客户端（线程局部存储）。"""
-    if not hasattr(_thread_local, 'client') or _thread_local.client is None or _thread_local.client.is_closed:
-        _thread_local.client = httpx.AsyncClient(
-            limits=_HTTPX_LIMITS,
-            timeout=_HTTPX_TIMEOUT,
-            verify=False,
-            follow_redirects=True,
-            http2=False
-        )
-    return _thread_local.client
 
 # --- 配置管理 & 缓存 ---
 def load_json_file(filename, default_content):
@@ -470,27 +456,33 @@ def upload_and_send_links(context: CallbackContext, chat_id: int, file_path: str
         logger.error(f"文件上传失败: {e}")
         context.bot.send_message(chat_id, f"⚠️ 文件上传到外部服务器失败: `{escape_markdown_v2(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
 
+# ============================================================
+# 替换区域：将以下三个函数完整替换原文件中的对应函数
+# ============================================================
+
 def _run_async_api_call(coro):
     """
-    为每次同步API调用创建隔离的事件循环。
-    避免全局客户端跨循环导致的RuntimeError。
+    在当前线程中安全运行异步协程。
+    每次创建独立的事件循环，彻底避免跨线程/跨循环复用问题。
     """
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
         try:
-            # 清理loop内所有pending tasks
+            # 清理所有残留的异步任务
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
             if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        finally:
-            loop.close()
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        except Exception:
+            pass
+        loop.close()
 
 
-# --- FOFA API 核心逻辑 ---
 async def _make_api_request_async(
     url: str,
     params: dict,
@@ -499,6 +491,14 @@ async def _make_api_request_async(
     retries: int = 10,
     proxy_url: str | None = None
 ) -> tuple[dict | None, str | None]:
+    """
+    异步FOFA API请求 —— 修复版。
+    
+    修复内容:
+    1. 不再使用全局单例 AsyncClient，每次创建独立客户端（在 async with 内自动关闭）
+    2. 新增对 FOFA [-501] 服务错误的重试支持
+    3. 正确传递代理参数
+    """
     if use_b64 and 'q' in params:
         params['qbase64'] = base64.b64encode(
             params.pop('q').encode('utf-8')
@@ -506,64 +506,99 @@ async def _make_api_request_async(
 
     last_error = None
 
-    # 根据是否有代理决定使用全局客户端还是临时客户端
+    # 构造客户端参数
+    client_kwargs = {
+        "limits": _HTTPX_LIMITS,
+        "timeout": _HTTPX_TIMEOUT,
+        "verify": False,
+        "follow_redirects": True,
+        "http2": False,
+    }
     if proxy_url:
-        client_ctx = httpx.AsyncClient(
-            proxies=proxy_url,
-            limits=_HTTPX_LIMITS,
-            timeout=_HTTPX_TIMEOUT,
-            verify=False,
-            follow_redirects=True,
-        )
-    else:
-        # 使用全局单例（无需with语句管理生命周期）
-        client_ctx = None
+        client_kwargs["proxies"] = proxy_url
 
-    async def _do_requests(client):
-        nonlocal last_error
+    async with httpx.AsyncClient(**client_kwargs) as client:
         for attempt in range(retries):
             try:
-                response = await client.get(url, params=params, timeout=timeout)
+                response = await client.get(
+                    url,
+                    params=params,
+                    timeout=timeout,
+                )
 
+                # --- HTTP 状态码级别的重试 ---
                 if response.status_code == 429:
                     wait_time = 5 * (attempt + 1)
-                    logger.warning(f"FOFA API rate limit (429). Retrying in {wait_time}s ({attempt+1}/{retries})")
+                    logger.warning(
+                        f"FOFA API rate limit (429). "
+                        f"Retrying in {wait_time}s ({attempt+1}/{retries})"
+                    )
                     await asyncio.sleep(wait_time)
                     last_error = "API请求因速率限制(429)失败"
                     continue
 
-                if response.status_code == 502:
+                if response.status_code in (500, 502, 503, 504):
                     wait_time = 5 * (attempt + 1)
-                    logger.warning(f"FOFA API 502. Retrying in {wait_time}s ({attempt+1}/{retries})")
+                    logger.warning(
+                        f"FOFA API {response.status_code}. "
+                        f"Retrying in {wait_time}s ({attempt+1}/{retries})"
+                    )
                     await asyncio.sleep(wait_time)
-                    last_error = "API请求失败 (502 Bad Gateway)"
+                    last_error = f"API请求失败 ({response.status_code})"
                     continue
 
                 response.raise_for_status()
                 data = response.json()
+
+                # --- JSON body 级别的错误处理与重试 ---
                 if data.get("error"):
-                    return None, data.get("errmsg", "未知的FOFA错误")
+                    errmsg = data.get("errmsg", "未知的FOFA错误")
+
+                    # [-501] 服务端临时错误，可重试
+                    if "[-501]" in errmsg:
+                        wait_time = 3 * (attempt + 1)
+                        logger.warning(
+                            f"FOFA [-501] 服务错误. "
+                            f"Retrying in {wait_time}s ({attempt+1}/{retries})"
+                        )
+                        await asyncio.sleep(wait_time)
+                        last_error = errmsg
+                        continue
+
+                    # [-4]  查询语法错误等，不可重试
+                    # 其他未知错误码，也直接返回
+                    return None, errmsg
+
                 return data, None
 
             except httpx.TimeoutException as e:
                 last_error = f"请求超时: {e}"
-                await asyncio.sleep(5 * (attempt + 1))
+                wait_time = 5 * (attempt + 1)
+                logger.error(
+                    f"Timeout on attempt {attempt+1}, "
+                    f"retrying in {wait_time}s"
+                )
+                await asyncio.sleep(wait_time)
+
             except httpx.RequestError as e:
                 last_error = f"网络请求失败: {e}"
-                await asyncio.sleep(5 * (attempt + 1))
+                wait_time = 5 * (attempt + 1)
+                logger.error(
+                    f"RequestError on attempt {attempt+1}, "
+                    f"retrying in {wait_time}s: {e}"
+                )
+                await asyncio.sleep(wait_time)
+
             except Exception as e:
                 last_error = f"解析响应失败: {e}"
                 logger.error(f"Unexpected error: {e}", exc_info=True)
                 break
 
-        return None, last_error or "API请求未知错误"
-
-    if client_ctx:
-        async with client_ctx as client:
-            return await _do_requests(client)
-    else:
-        return await _do_requests(_get_async_client())
-
+    logger.error(
+        f"API request failed after {retries} retries. "
+        f"Last error: {last_error}"
+    )
+    return None, last_error or "API请求未知错误"
 
 def verify_fofa_api(key): return _make_api_request(FOFA_INFO_URL, {'key': key}, timeout=15, use_b64=False, retries=3)
 def fetch_fofa_data(key, query, page=1, page_size=10000, fields="host", proxy_session=None, full_mode=None):
@@ -602,8 +637,7 @@ def _make_api_request(
     proxy_session: str | None = None
 ) -> tuple[dict | None, str | None]:
     """
-    同步兼容层：将异步请求包装为同步调用。
-    函数签名与原版完全一致，业务代码零修改。
+    同步兼容层（函数签名不变，业务代码零修改）。
     """
     return _run_async_api_call(
         _make_api_request_async(
@@ -4076,16 +4110,6 @@ def main() -> None:
     logger.info(f"🚀 Fofa Bot v10.9 (稳定版) 已启动...")
     updater.start_polling()
     updater.idle()
-
-    # === 新增：优雅关闭异步客户端 ===
-    global _async_client
-    if _async_client and not _async_client.is_closed:
-        try:
-            asyncio.run(_async_client.aclose())
-            logger.info("httpx AsyncClient 已关闭。")
-        except Exception as e:
-            logger.warning(f"关闭 httpx 客户端时出错: {e}")
-
     logger.info("Bot has been shut down gracefully.")
 
 if __name__ == "__main__":
